@@ -1,17 +1,31 @@
 {
   "name": "printers-monitor",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "src/monitor.js",
+  "description": "Sistema professionale di monitoraggio stampanti SNMP con mappings configurabili",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node src/index.js",
+    "start": "node src/monitor.js",
+    "monitor": "node src/monitor.js",
+    "walk": "node src/walkOids.js", 
+    "scrape": "node src/indexScraping.js",
+    "legacy": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": [
+    "snmp",
+    "printer",
+    "monitoring",
+    "network",
+    "mib",
+    "oid"
+  ],
+  "author": "Domenicod25",
+  "license": "MIT",
   "dependencies": {
-    "net-snmp": "^3.12.1"
+    "cheerio": "^1.1.2",
+    "minimist": "^1.2.8",
+    "net-snmp": "^3.12.1",
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^24.20.0"
   }
 }
