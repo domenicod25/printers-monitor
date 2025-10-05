@@ -4,7 +4,8 @@
   "main": "src/monitor.js",
   "description": "Sistema professionale di monitoraggio stampanti SNMP con mappings configurabili",
   "scripts": {
-    "start": "node src/monitor.js",
+    "start": "node src/monitor.js --daemon",
+    "daemon": "node src/monitor.js --daemon",
     "monitor": "node src/monitor.js",
     "monitor:cloud": "node src/monitorCloud.js",
     "walk": "node src/walkOids.js", 
@@ -27,7 +28,6 @@
     "cheerio": "^1.1.2",
     "minimist": "^1.2.8",
     "net-snmp": "^3.12.1",
-    "node-fetch": "^3.3.2",
     "puppeteer": "^24.20.0"
   }
 }
