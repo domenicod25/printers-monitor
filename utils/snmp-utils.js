@@ -226,6 +226,19 @@ class MappingManager {
      * Carica la configurazione generale
      */
     loadConfig() {
+        // Try embedded config first (for production builds)
+        try {
+            const embeddedPath = path.join(__dirname, '../src/embedded-mapping-config.json');
+            if (fs.existsSync(embeddedPath)) {
+                this.config = JSON.parse(fs.readFileSync(embeddedPath, 'utf8'));
+                console.log('✅ Loaded embedded mapping configuration');
+                return;
+            }
+        } catch (error) {
+            // Continue to fallback
+        }
+
+        // Fallback to local config (for development)
         const configPath = path.join(this.configDir, 'config.json');
         
         if (!fs.existsSync(configPath)) {
@@ -234,6 +247,7 @@ class MappingManager {
 
         try {
             this.config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            console.log('⚠️  Using development mapping config (fallback)');
         } catch (error) {
             throw new Error(`Failed to load config: ${error.message}`);
         }
@@ -271,6 +285,23 @@ class MappingManager {
             return this.mappings.get(modelName);
         }
 
+        // Try embedded mappings first (for production builds)
+        try {
+            const embeddedMappingsPath = path.join(__dirname, '../src/embedded-mappings.json');
+            if (fs.existsSync(embeddedMappingsPath)) {
+                const allMappings = JSON.parse(fs.readFileSync(embeddedMappingsPath, 'utf8'));
+                if (allMappings[modelName]) {
+                    const mapping = allMappings[modelName];
+                    this.mappings.set(modelName, mapping);
+                    console.log(`✅ Loaded embedded mapping for: ${modelName}`);
+                    return mapping;
+                }
+            }
+        } catch (error) {
+            // Continue to fallback
+        }
+
+        // Fallback to local mapping file (for development)
         const mappingPath = path.join(this.mappingsDir, `${modelName}.json`);
         
         if (!fs.existsSync(mappingPath)) {
@@ -280,6 +311,7 @@ class MappingManager {
         try {
             const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf8'));
             this.mappings.set(modelName, mapping);
+            console.log(`⚠️  Using development mapping for: ${modelName} (fallback)`);
             return mapping;
         } catch (error) {
             throw new Error(`Failed to load mapping ${modelName}: ${error.message}`);

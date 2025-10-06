@@ -1,0 +1,160 @@
+{
+  "metadata": {
+    "name": "develop_ineo_250i",
+    "displayName": "Develop ineo+ 250i",
+    "vendor": "Develop",
+    "type": "multifunction",
+    "created": "2025-09-26",
+    "version": "1.0.0"
+  },
+  "identification": {
+    "sysDescr_patterns": [
+      "Develop ineo\\+ 250i",
+      "Develop.*250i"
+    ],
+    "exact_match": false
+  },
+  "mappings": {
+    "basic": {
+      "model": {
+        "oid": "1.3.6.1.2.1.1.1.0",
+        "type": "string",
+        "description": "Model name from system description"
+      },
+      "serialNumber": {
+        "oid": "1.3.6.1.2.1.43.5.1.1.17.1",
+        "type": "string", 
+        "description": "Printer serial number"
+      },
+      "printerName": {
+        "oid": "1.3.6.1.2.1.43.5.1.1.16.1",
+        "type": "string",
+        "description": "Printer name/location"
+      }
+    },
+    "status": {
+      "printerStatus": {
+        "oid": "1.3.6.1.2.1.43.16.5.1.2.1.1",
+        "type": "integer",
+        "description": "Overall printer status",
+        "values": {
+          "1": "other",
+          "2": "unknown", 
+          "3": "idle",
+          "4": "printing",
+          "5": "warmup"
+        }
+      },
+      "detailedStatus": {
+        "oid": "1.3.6.1.2.1.43.18.1.1.8.1.1",
+        "type": "string",
+        "description": "Detailed status message"
+      }
+    },
+    "toner": {
+      "cyan": {
+        "level_oid": "1.3.6.1.2.1.43.11.1.1.9.1.1",
+        "capacity_oid": "1.3.6.1.2.1.43.11.1.1.8.1.1",
+        "type": "integer",
+        "unit": "percent",
+        "description": "Cyan toner level"
+      },
+      "magenta": {
+        "level_oid": "1.3.6.1.2.1.43.11.1.1.9.1.2", 
+        "capacity_oid": "1.3.6.1.2.1.43.11.1.1.8.1.2",
+        "type": "integer",
+        "unit": "percent",
+        "description": "Magenta toner level"
+      },
+      "yellow": {
+        "level_oid": "1.3.6.1.2.1.43.11.1.1.9.1.3",
+        "capacity_oid": "1.3.6.1.2.1.43.11.1.1.8.1.3", 
+        "type": "integer",
+        "unit": "percent",
+        "description": "Yellow toner level"
+      },
+      "black": {
+        "level_oid": "1.3.6.1.2.1.43.11.1.1.9.1.4",
+        "capacity_oid": "1.3.6.1.2.1.43.11.1.1.8.1.4",
+        "type": "integer", 
+        "unit": "percent",
+        "description": "Black toner level"
+      }
+    },
+    "paper": {
+      "tray1": {
+        "current_oid": "1.3.6.1.2.1.43.8.2.1.10.1.1",
+        "capacity_oid": "1.3.6.1.2.1.43.8.2.1.9.1.1",
+        "type": "integer",
+        "unit": "sheets",
+        "description": "Tray 1 paper level"
+      },
+      "tray2": {
+        "current_oid": "1.3.6.1.2.1.43.8.2.1.10.1.2",
+        "capacity_oid": "1.3.6.1.2.1.43.8.2.1.9.1.2", 
+        "type": "integer",
+        "unit": "sheets",
+        "description": "Tray 2 paper level"
+      },
+      "bypass": {
+        "current_oid": "1.3.6.1.2.1.43.8.2.1.10.1.3",
+        "capacity_oid": "1.3.6.1.2.1.43.8.2.1.9.1.3",
+        "type": "integer", 
+        "unit": "sheets",
+        "description": "Bypass tray paper level"
+      }
+    },
+    "counters": {
+      "totalPages": {
+        "oid": "TBD",
+        "type": "integer",
+        "unit": "pages", 
+        "description": "Total pages printed (to be determined from walk)"
+      },
+      "colorPages": {
+        "oid": "TBD",
+        "type": "integer",
+        "unit": "pages",
+        "description": "Color pages printed (to be determined)"
+      },
+      "bwPages": {
+        "oid": "TBD", 
+        "type": "integer",
+        "unit": "pages",
+        "description": "Black & white pages printed (to be determined)"
+      },
+      "copies": {
+        "oid": "TBD",
+        "type": "integer", 
+        "unit": "copies",
+        "description": "Total copies made (to be determined)"
+      },
+      "scans": {
+        "oid": "TBD",
+        "type": "integer",
+        "unit": "scans", 
+        "description": "Total scans made (to be determined)"
+      }
+    }
+  },
+  "maintenance": {
+    "drumUnit": {
+      "level_oid": "TBD",
+      "type": "integer",
+      "unit": "percent", 
+      "description": "Drum unit remaining life"
+    },
+    "fuserUnit": {
+      "level_oid": "TBD",
+      "type": "integer",
+      "unit": "percent",
+      "description": "Fuser unit remaining life"
+    }
+  },
+  "notes": [
+    "OID with 'TBD' need to be identified from walk results",
+    "Counter OIDs are usually vendor-specific",
+    "Some values might require calculation or conversion",
+    "Test all OIDs before putting in production"
+  ]
+}

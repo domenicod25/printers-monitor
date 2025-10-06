@@ -5,6 +5,16 @@
     "author": "NextOffices",
     "created": "2025-09-26"
   },
+  "backend": {
+    "enabled": true,
+    "url": "http://localhost:3000/v1",
+    "api_key": "test-api-key-123",
+    "tenant_id": "2b999e52-d67c-41b1-a772-c22a20db4abd",
+    "agent_version": "1.0.0",
+    "submit_on_collect": true,
+    "retry_attempts": 3,
+    "retry_delay": 5000
+  },
   "defaults": {
     "snmp": {
       "community": "public",
