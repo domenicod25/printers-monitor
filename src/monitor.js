@@ -35,6 +35,7 @@ try {
     console.log('✅ Loaded embedded configuration');
     console.log('   Backend:', config.backend_url);
     console.log('   Tenant:', config.tenant_id);
+    console.log('   API Key:', config.api_key ? `${config.api_key.substring(0, 10)}...` : 'MISSING');
 } catch (error) {
     // Fallback per development
     try {
@@ -64,6 +65,7 @@ if (config.backend_url || config.backend?.enabled) {
     heartbeatManager = new HeartbeatManager({ ...config, ...backendConfig, printers: config.printers }, apiClient);
     
     console.log('🔗 API Client initialized');
+    console.log('   API Key for requests:', backendConfig.api_key ? `${backendConfig.api_key.substring(0, 10)}...` : 'MISSING');
 }
 // ============================================
 
