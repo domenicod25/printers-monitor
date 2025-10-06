@@ -679,21 +679,30 @@ class PrinterMonitor {
 
         try {
             const payload = {
-                device_info: {
+                device: {
                     ip_address: this.host,
                     model: this.model.name,
                     vendor: this.model.vendor,
                     serial_number: this.printerInfo.prtGeneralSerialNumber || null,
-                    sys_descr: this.printerInfo.sysDescr || '',
+                    mac_address: null, // TODO: Extract from SNMP if available
                 },
-                telemetry_data: {
+                telemetry: {
                     toner_levels: this.extractTonerLevels(),
                     paper_levels: this.extractPaperLevels(),
                     counters: this.extractCounters(),
                     status_info: this.extractStatus(),
                 },
+                collection_metadata: {
+                    successful_oids: this.data.metadata?.successful_oids,
+                    total_oids: this.data.metadata?.total_oids,
+                },
                 collected_at: new Date().toISOString(),
             };
+
+            // Debug: log payload in development
+            if (process.env.DEBUG_TELEMETRY) {
+                console.log('📋 Telemetry payload:', JSON.stringify(payload, null, 2));
+            }
 
             await this.apiClient.post('/telemetry', payload);
             console.log('✅ Telemetry submitted successfully');
