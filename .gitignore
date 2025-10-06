@@ -89,3 +89,13 @@ public/
 
 # MacOS files
 .DS_Store
+
+# Project specific - Runtime generated files
+output/
+walks/
+src/embedded-config.json
+src/embedded-mapping-config.json
+src/embedded-mappings.json
+
+# Development files
+src/indexScraping.js
