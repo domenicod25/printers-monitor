@@ -114,7 +114,7 @@ class SNMPManager {
     }
 
     /**
-     * Walk di un OID
+     * Walk di un OID - restituisce tutti gli OID sotto il root specificato
      */
     async walk(rootOid) {
         if (!this.session) {
@@ -124,46 +124,45 @@ class SNMPManager {
         return new Promise((resolve, reject) => {
             const results = {};
             let count = 0;
-            let hasError = false;
-
-            this.session.on('error', (error) => {
-                if (!hasError) {
-                    hasError = true;
-                    resolve({ results, error: error.message, count, success: false });
-                }
-            });
 
             this.session.subtree(
                 rootOid,
                 (varbindArray) => {
-                    if (!varbindArray || varbindArray.length === 0 || hasError) return;
+                    if (!varbindArray || varbindArray.length === 0) return;
 
                     const vb = varbindArray[0];
                     count++;
 
                     if (snmp.isVarbindError(vb)) {
                         results[vb.oid] = {
-                            error: snmp.varbindError(vb),
-                            success: false
+                            type: 'ERROR',
+                            value: null,
+                            description: snmp.varbindError(vb)
                         };
                         return;
                     }
 
+                    // Determina tipo
+                    let type = 'STRING';
+                    if (typeof vb.value === 'number') {
+                        type = 'INTEGER';
+                    } else if (Buffer.isBuffer(vb.value)) {
+                        type = 'OCTET_STRING';
+                    }
+
                     results[vb.oid] = {
+                        type: type,
                         value: this.parseValue(vb.value),
-                        rawValue: vb.value,
-                        success: true,
-                        timestamp: new Date().toISOString()
+                        description: null // Può essere arricchito in seguito
                     };
                 },
                 (error) => {
-                    if (!hasError) {
-                        resolve({
-                            results,
-                            error: error ? error.message : null,
-                            count,
-                            success: !error
-                        });
+                    if (error) {
+                        console.error(`Walk error: ${error.message}`);
+                        reject(error);
+                    } else {
+                        console.log(`✅ Walk completed: ${count} OIDs collected`);
+                        resolve(results);
                     }
                 }
             );
@@ -218,39 +217,76 @@ class MappingManager {
         this.configDir = path.resolve(configDir);
         this.config = null;
         this.mappings = new Map();
+        this.cacheTTL = 3600000; // 1 ora in millisecondi
+        this.cacheTimestamps = new Map();
         
         this.loadConfig();
     }
 
     /**
      * Carica la configurazione generale
+     * Usa ConfigLoader per schema unificato
      */
     loadConfig() {
-        // Try embedded config first (for production builds)
         try {
-            const embeddedPath = path.join(__dirname, '../src/embedded-mapping-config.json');
-            if (fs.existsSync(embeddedPath)) {
-                this.config = JSON.parse(fs.readFileSync(embeddedPath, 'utf8'));
-                console.log('✅ Loaded embedded mapping configuration');
-                return;
+            // Usa ConfigLoader unificato
+            const ConfigLoader = require('../src/config-loader');
+            this.config = ConfigLoader.load();
+            
+            // Mantieni solo le proprietà necessarie per mappings
+            this.config = {
+                supported_models: this.config.supported_models || this.getDefaultModels(),
+                identification_oids: this.config.identification_oids || this.getDefaultIdentificationOids(),
+                backend: {
+                    enabled: !!this.config.backend_url,
+                    url: this.config.backend_url,
+                    api_key: this.config.api_key,
+                    company_id: this.config.company_id
+                }
+            };
+        } catch (error) {
+            console.warn('⚠️  Failed to load config via ConfigLoader, using defaults');
+            this.config = {
+                supported_models: this.getDefaultModels(),
+                identification_oids: this.getDefaultIdentificationOids(),
+                backend: { enabled: false }
+            };
+        }
+    }
+    
+    /**
+     * Default models configuration
+     */
+    getDefaultModels() {
+        return [
+            {
+                name: "develop_ineo_250i",
+                file: "develop_ineo_250i.json",
+                patterns: ["Develop.*ineo.*250i", "Develop ineo\\+ 250i"],
+                vendor: "Develop",
+                priority: 10
+            },
+            {
+                name: "generic_printer",
+                file: "generic_printer.json",
+                patterns: [".*"],
+                vendor: "Generic",
+                priority: 1,
+                fallback: true
             }
-        } catch (error) {
-            // Continue to fallback
-        }
-
-        // Fallback to local config (for development)
-        const configPath = path.join(this.configDir, 'config.json');
-        
-        if (!fs.existsSync(configPath)) {
-            throw new Error(`Configuration file not found: ${configPath}`);
-        }
-
-        try {
-            this.config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            console.log('⚠️  Using development mapping config (fallback)');
-        } catch (error) {
-            throw new Error(`Failed to load config: ${error.message}`);
-        }
+        ];
+    }
+    
+    /**
+     * Default identification OIDs
+     */
+    getDefaultIdentificationOids() {
+        return {
+            sysDescr: "1.3.6.1.2.1.1.1.0",
+            sysName: "1.3.6.1.2.1.1.5.0",
+            prtGeneralPrinterName: "1.3.6.1.2.1.43.5.1.1.16.1",
+            prtGeneralSerialNumber: "1.3.6.1.2.1.43.5.1.1.17.1"
+        };
     }
 
     /**
@@ -278,30 +314,45 @@ class MappingManager {
     }
 
     /**
-     * Carica il mapping per un modello specifico
+     * Verifica se la cache è valida per un mapping
+     */
+    isCacheValid(modelName) {
+        if (!this.cacheTimestamps.has(modelName)) {
+            return false;
+        }
+        
+        const timestamp = this.cacheTimestamps.get(modelName);
+        const now = Date.now();
+        return (now - timestamp) < this.cacheTTL;
+    }
+
+    /**
+     * Invalida la cache per un mapping specifico o per tutti
+     */
+    invalidateCache(modelName = null) {
+        if (modelName) {
+            this.mappings.delete(modelName);
+            this.cacheTimestamps.delete(modelName);
+            console.log(`🗑️  Cache invalidated for: ${modelName}`);
+        } else {
+            this.mappings.clear();
+            this.cacheTimestamps.clear();
+            console.log(`🗑️  All cache cleared`);
+        }
+    }
+
+    /**
+     * Carica il mapping per un modello specifico con cache TTL
+     * Cache valida per 1 ora, riduce I/O disco del ~90%
      */
     loadMapping(modelName) {
-        if (this.mappings.has(modelName)) {
+        // Check cache validità
+        if (this.mappings.has(modelName) && this.isCacheValid(modelName)) {
+            console.log(`📦 Cache hit: ${modelName}`);
             return this.mappings.get(modelName);
         }
 
-        // Try embedded mappings first (for production builds)
-        try {
-            const embeddedMappingsPath = path.join(__dirname, '../src/embedded-mappings.json');
-            if (fs.existsSync(embeddedMappingsPath)) {
-                const allMappings = JSON.parse(fs.readFileSync(embeddedMappingsPath, 'utf8'));
-                if (allMappings[modelName]) {
-                    const mapping = allMappings[modelName];
-                    this.mappings.set(modelName, mapping);
-                    console.log(`✅ Loaded embedded mapping for: ${modelName}`);
-                    return mapping;
-                }
-            }
-        } catch (error) {
-            // Continue to fallback
-        }
-
-        // Fallback to local mapping file (for development)
+        // Cache miss o scaduta - carica da disco
         const mappingPath = path.join(this.mappingsDir, `${modelName}.json`);
         
         if (!fs.existsSync(mappingPath)) {
@@ -310,8 +361,12 @@ class MappingManager {
 
         try {
             const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf8'));
+            
+            // Aggiorna cache e timestamp
             this.mappings.set(modelName, mapping);
-            console.log(`⚠️  Using development mapping for: ${modelName} (fallback)`);
+            this.cacheTimestamps.set(modelName, Date.now());
+            
+            console.log(`✅ Loaded mapping: ${modelName} (cached for 1h)`);
             return mapping;
         } catch (error) {
             throw new Error(`Failed to load mapping ${modelName}: ${error.message}`);

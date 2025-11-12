@@ -17,56 +17,29 @@ const axios = require('axios');
 const argv = require('minimist')(process.argv.slice(2));
 const { SNMPManager, MappingManager, Utils } = require('../utils/snmp-utils');
 const APIClient = require('./api-client');
-const HeartbeatManager = require('./heartbeat');
+const ConfigLoader = require('./config-loader');
 
 // ============================================
-// CONFIGURATION LOADING
+// CONFIGURATION LOADING (UNIFIED)
 // ============================================
-/**
- * Carica configurazione: prima tenta embedded config (produzione),
- * poi fallback a config.json (development)
- */
 let config;
 try {
-    // In produzione (nexe), config è embedded come risorsa
-    const embeddedPath = path.join(__dirname, 'embedded-config.json');
-    const configContent = fs.readFileSync(embeddedPath, 'utf-8');
-    config = JSON.parse(configContent);
-    console.log('✅ Loaded embedded configuration');
-    console.log('   Backend:', config.backend_url);
-    console.log('   Tenant:', config.tenant_id);
-    console.log('   API Key:', config.api_key ? `${config.api_key.substring(0, 10)}...` : 'MISSING');
+    config = ConfigLoader.load();
 } catch (error) {
-    // Fallback per development
-    try {
-        config = require('../configs/config.json');
-        console.log('⚠️  Using development config (fallback)');
-        console.log('   Backend:', config.backend?.url || 'not configured');
-    } catch (fallbackError) {
-        console.error('❌ Failed to load configuration:', fallbackError.message);
-        process.exit(1);
-    }
+    console.error('❌ Failed to load configuration:', error.message);
+    process.exit(1);
 }
 
-// Inizializza API Client (se backend configurato)
-let apiClient = null;
-let heartbeatManager = null;
+// Inizializza API Client
+const apiClient = new APIClient({
+    backend_url: config.backend_url,
+    api_key: config.api_key,
+    company_id: config.company_id,
+    retry_attempts: config.retry_attempts,
+    retry_delay: config.retry_delay,
+});
 
-if (config.backend_url || config.backend?.enabled) {
-    const backendConfig = {
-        backend_url: config.backend_url || config.backend?.url,
-        api_key: config.api_key || config.backend?.api_key,
-        tenant_id: config.tenant_id || config.backend?.tenant_id,
-        retry_attempts: config.backend?.retry_attempts || 3,
-        retry_delay: config.backend?.retry_delay || 5000,
-    };
-    
-    apiClient = new APIClient(backendConfig);
-    heartbeatManager = new HeartbeatManager({ ...config, ...backendConfig, printers: config.printers }, apiClient);
-    
-    console.log('🔗 API Client initialized');
-    console.log('   API Key for requests:', backendConfig.api_key ? `${backendConfig.api_key.substring(0, 10)}...` : 'MISSING');
-}
+console.log('🔗 API Client initialized');
 // ============================================
 
 
@@ -89,7 +62,6 @@ class PrinterMonitor {
         this.mapping = null;
         this.data = {};
         this.apiClient = options.apiClient || null; // API Client per backend
-        this.heartbeatManager = options.heartbeatManager || null; // Heartbeat manager
     }
 
     /**
@@ -166,58 +138,32 @@ class PrinterMonitor {
 
     /**
      * Raccoglie tutti i dati secondo il mapping
+     * Usa DataCollector per separazione responsabilità
      */
     async collectData() {
         console.log('📊 Raccolta dati in corso...');
         
-        const oids = this.mappingManager.getAllOids(this.mapping);
+        const { DataCollector } = require('./data-processors');
+        const collector = new DataCollector(this.snmp, this.mapping);
         
-        if (oids.length === 0) {
-            throw new Error('No valid OIDs found in mapping');
-        }
-
-        console.log(`   Interrogando ${oids.length} OID...`);
+        // Raccoglie e processa dati
+        const collectedData = await collector.collect();
         
-        // Interroga gli OID uno alla volta per gestire meglio gli errori
-        const snmpResults = {};
-        let successCount = 0;
-        
-        for (const oid of oids) {
-            try {
-                const result = await this.snmp.get([oid]);
-                snmpResults[oid] = result[oid];
-                if (result[oid] && result[oid].success) {
-                    successCount++;
-                }
-            } catch (error) {
-                console.log(`   ⚠️  OID ${oid}: ${error.message}`);
-                snmpResults[oid] = {
-                    error: error.message,
-                    success: false
-                };
-            }
-        }
-        
-        console.log(`   ✅ OID riusciti: ${successCount}/${oids.length}`);
-        
-        // Struttura i dati secondo il mapping
+        // Aggiungi metadata host e model
         this.data = {
             metadata: {
-                timestamp: Utils.timestamp(),
+                ...collectedData.metadata,
                 host: this.host,
-                model: this.model,
-                mapping_version: this.mapping.metadata.version,
-                successful_oids: successCount,
-                total_oids: oids.length
+                model: this.model
             },
-            basic: this.processSection(this.mapping.mappings.basic, snmpResults),
-            status: this.processSection(this.mapping.mappings.status, snmpResults),
-            toner: this.processTonerSection(this.mapping.mappings.toner, snmpResults),
-            paper: this.processPaperSection(this.mapping.mappings.paper, snmpResults),
-            counters: this.processSection(this.mapping.mappings.counters, snmpResults),
-            raw: this.options.format === 'raw' ? snmpResults : undefined
+            basic: collectedData.basic,
+            status: collectedData.status,
+            toner: collectedData.toner,
+            paper: collectedData.paper,
+            counters: collectedData.counters,
+            raw: this.options.format === 'raw' ? collectedData.raw : undefined
         };
-
+        
         // Pulisci undefined
         Object.keys(this.data).forEach(key => {
             if (this.data[key] === undefined) {
@@ -226,161 +172,6 @@ class PrinterMonitor {
         });
 
         return this.data;
-    }
-
-    /**
-     * Processa una sezione generica del mapping
-     */
-    processSection(sectionMapping, snmpResults) {
-        if (!sectionMapping) return {};
-
-        const result = {};
-        
-        for (const [key, config] of Object.entries(sectionMapping)) {
-            if (config.oid && config.oid !== 'TBD') {
-                const snmpResult = snmpResults[config.oid];
-                
-                if (snmpResult && snmpResult.success) {
-                    result[key] = {
-                        value: snmpResult.value,
-                        description: config.description,
-                        unit: config.unit,
-                        type: config.type
-                    };
-
-                    // Applica valori mappati se presenti
-                    if (config.values && result[key].value in config.values) {
-                        result[key].displayValue = config.values[result[key].value];
-                    }
-                } else {
-                    result[key] = {
-                        error: snmpResult ? snmpResult.error : 'OID not found',
-                        description: config.description
-                    };
-                }
-            } else {
-                result[key] = {
-                    error: 'OID not configured (TBD)',
-                    description: config.description
-                };
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Processa la sezione toner con calcoli percentuali
-     */
-    processTonerSection(tonerMapping, snmpResults) {
-        if (!tonerMapping) return {};
-
-        const result = {};
-        
-        for (const [color, config] of Object.entries(tonerMapping)) {
-            const levelResult = snmpResults[config.level_oid];
-            const capacityResult = snmpResults[config.capacity_oid];
-            
-            if (levelResult && levelResult.success) {
-                result[color] = {
-                    level: levelResult.value,
-                    capacity: capacityResult && capacityResult.success ? capacityResult.value : null,
-                    percentage: this.calculateTonerPercentage(levelResult.value, capacityResult?.value),
-                    unit: config.unit,
-                    description: config.description,
-                    status: this.getTonerStatus(levelResult.value)
-                };
-            } else {
-                result[color] = {
-                    error: levelResult ? levelResult.error : 'Level OID not found',
-                    description: config.description
-                };
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Processa la sezione carta con calcoli
-     */
-    processPaperSection(paperMapping, snmpResults) {
-        if (!paperMapping) return {};
-
-        const result = {};
-        
-        for (const [tray, config] of Object.entries(paperMapping)) {
-            const currentResult = snmpResults[config.current_oid];
-            const capacityResult = snmpResults[config.capacity_oid];
-            
-            if (currentResult && currentResult.success) {
-                const current = currentResult.value;
-                const capacity = capacityResult && capacityResult.success ? capacityResult.value : null;
-                
-                result[tray] = {
-                    current: current,
-                    capacity: capacity,
-                    percentage: capacity ? Utils.calculatePercentage(current, capacity) : null,
-                    unit: config.unit,
-                    description: config.description,
-                    status: this.getPaperStatus(current, capacity)
-                };
-            } else {
-                result[tray] = {
-                    error: currentResult ? currentResult.error : 'Current level OID not found',
-                    description: config.description
-                };
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Calcola percentuale toner
-     */
-    calculateTonerPercentage(level, capacity) {
-        if (typeof level === 'number') {
-            // Se level è già una percentuale (0-100)
-            if (level >= 0 && level <= 100) {
-                return level;
-            }
-            // Se abbiamo capacità, calcola percentuale
-            if (capacity && capacity > 0) {
-                return Utils.calculatePercentage(level, capacity);
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Determina stato toner
-     */
-    getTonerStatus(level) {
-        if (typeof level !== 'number') return 'unknown';
-        
-        if (level <= 5) return 'critical';
-        if (level <= 15) return 'low';
-        if (level <= 30) return 'medium';
-        return 'good';
-    }
-
-    /**
-     * Determina stato carta
-     */
-    getPaperStatus(current, capacity) {
-        if (typeof current !== 'number') return 'unknown';
-        
-        if (current === 0) return 'empty';
-        
-        if (capacity) {
-            const percentage = Utils.calculatePercentage(current, capacity);
-            if (percentage <= 10) return 'low';
-            if (percentage <= 30) return 'medium';
-            return 'good';
-        }
-        
-        return current > 0 ? 'has_paper' : 'empty';
     }
 
     /**
@@ -450,7 +241,7 @@ class PrinterMonitor {
                 const response = await axios.post(url, payload, {
                     headers: {
                         'Content-Type': 'application/json',
-                        'x-tenant-id': backendConfig.tenant_id,
+                        'x-company-id': backendConfig.company_id,
                         'x-agent-version': backendConfig.agent_version,
                         'Authorization': `Bearer ${backendConfig.api_key}`
                     },
@@ -678,6 +469,7 @@ class PrinterMonitor {
         console.log('📤 Submitting telemetry to backend...');
 
         try {
+            const os = require('os');
             const payload = {
                 device: {
                     ip_address: this.host,
@@ -696,6 +488,15 @@ class PrinterMonitor {
                     successful_oids: this.data.metadata?.successful_oids,
                     total_oids: this.data.metadata?.total_oids,
                 },
+                // Metadata agent (consolidato da ex-heartbeat)
+                agent: {
+                    hostname: os.hostname(),
+                    platform: os.platform(),
+                    os_version: os.release(),
+                    agent_version: '1.0.0',
+                    uptime_seconds: Math.floor(process.uptime()),
+                    memory_usage_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+                },
                 collected_at: new Date().toISOString(),
             };
 
@@ -705,12 +506,7 @@ class PrinterMonitor {
             }
 
             await this.apiClient.post('/telemetry', payload);
-            console.log('✅ Telemetry submitted successfully');
-            
-            // Incrementa contatore heartbeat se disponibile
-            if (this.heartbeatManager) {
-                this.heartbeatManager.incrementTelemetry();
-            }
+            console.log('✅ Telemetry submitted (includes agent metadata)');
         } catch (error) {
             console.error('❌ Failed to submit telemetry:', error.message);
             // Non blocca l'agent, continua
@@ -769,6 +565,150 @@ class PrinterMonitor {
             detailed_status: status.hrDeviceStatus?.value || '',
         };
     }
+
+    // ==================== PHASE 2: MAPPING MANAGEMENT ====================
+
+    /**
+     * Verifica se sta usando il mapping generico (fallback)
+     */
+    isUsingGenericMapping() {
+        return this.mapping?.metadata?.name === 'generic_printer' || this.model?.fallback === true;
+    }
+
+    /**
+     * Esegue walk OID completo e lo carica al backend
+     */
+    async walkAndUploadOids() {
+        if (!this.apiClient) {
+            console.log('⚠️  No API client configured, cannot upload walk');
+            return null;
+        }
+
+        console.log('🚶 Executing OID walk for unknown printer...');
+        console.log(`   Model: ${this.model?.name || 'Unknown'}`);
+        console.log(`   Vendor: ${this.model?.vendor || 'Unknown'}`);
+
+        try {
+            // Esegui walk del Printer MIB (1.3.6.1.2.1.43)
+            const walkData = await this.snmp.walk('1.3.6.1.2.1.43');
+            
+            if (!walkData || Object.keys(walkData).length === 0) {
+                console.log('⚠️  No data collected from walk');
+                return null;
+            }
+
+            console.log(`✅ Walk completed: ${Object.keys(walkData).length} OIDs collected`);
+
+            // Prepara payload per backend
+            const payload = {
+                device_ip: this.host,
+                model: this.model?.name || 'Unknown',
+                vendor: this.model?.vendor || 'Unknown',
+                sys_descr: this.printerInfo.sysDescr || '',
+                walk_data: walkData,
+            };
+
+            // Upload al backend
+            console.log('☁️  Uploading walk to backend...');
+            const response = await this.apiClient.post('/telemetry/walks', payload);
+            console.log('✅ Walk uploaded successfully');
+            console.log(`   Walk ID: ${response.walk_id}`);
+
+            return response.walk_id;
+
+        } catch (error) {
+            console.error('❌ Failed to walk and upload OIDs:', error.message);
+            return null;
+        }
+    }
+
+    /**
+     * Marca il device come "needs_mapping" nel backend
+     */
+    async markAsUnmapped(walkId) {
+        if (!this.apiClient) {
+            console.log('⚠️  No API client configured, cannot mark as unmapped');
+            return;
+        }
+
+        try {
+            console.log('📝 Marking device as needs_mapping...');
+            
+            const payload = {
+                walk_id: walkId,
+                needs_mapping: true,
+                mapping_name: 'generic_printer',
+            };
+
+            // POST /agent/devices/:ip/mark-unmapped (public endpoint for agents)
+            await this.apiClient.post(`/agent/devices/${this.host}/mark-unmapped`, payload);
+            
+            console.log('✅ Device marked as needs_mapping');
+            console.log('   Super admin can now create specific mapping from walk data');
+
+        } catch (error) {
+            // Non bloccare l'agent se fallisce
+            console.error('⚠️  Failed to mark device as unmapped:', error.message);
+        }
+    }
+
+    /**
+     * Verifica se esistono nuovi mappings disponibili sul backend
+     */
+    async checkForNewMapping() {
+        if (!this.apiClient) {
+            return null;
+        }
+
+        try {
+            // Tenta di scaricare mapping specifico per questo modello
+            const modelName = this.model?.name || this.printerInfo.sysDescr;
+            if (!modelName) return null;
+
+            console.log(`🔍 Checking for mapping: ${modelName}`);
+            
+            // GET /agent/mappings/:name (public endpoint for agents)
+            const mapping = await this.apiClient.get(`/agent/mappings/${encodeURIComponent(modelName)}`);
+            
+            if (mapping && mapping.is_active) {
+                console.log(`✅ New mapping found: ${mapping.display_name}`);
+                console.log(`   Version: ${mapping.version}`);
+                
+                // Salva mapping in locale per cache
+                this.saveMapping(modelName, mapping.mappings);
+                
+                return mapping;
+            }
+
+        } catch (error) {
+            // 404 è normale se il mapping non esiste ancora
+            if (error.response?.status !== 404) {
+                console.error('⚠️  Failed to check for new mapping:', error.message);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Salva mapping scaricato dal backend in locale
+     */
+    saveMapping(modelName, mappingData) {
+        try {
+            const mappingsDir = path.join(__dirname, '../mappings');
+            if (!fs.existsSync(mappingsDir)) {
+                fs.mkdirSync(mappingsDir, { recursive: true });
+            }
+
+            const filepath = path.join(mappingsDir, `${modelName}.json`);
+            fs.writeFileSync(filepath, JSON.stringify(mappingData, null, 2));
+            
+            console.log(`💾 Mapping saved locally: ${filepath}`);
+
+        } catch (error) {
+            console.error('⚠️  Failed to save mapping locally:', error.message);
+        }
+    }
 }
 
 /**
@@ -780,7 +720,6 @@ async function monitorPrinter(printerConfig) {
         timeout: 10000,
         retries: 2,
         apiClient: apiClient,
-        heartbeatManager: heartbeatManager,
     });
 
     try {
@@ -793,21 +732,46 @@ async function monitorPrinter(printerConfig) {
         // 3. Carica mapping
         monitor.loadMapping();
 
-        // 4. Se mapping non esiste E walk_on_unknown=true
-        if (!monitor.mapping && config.schedule?.walk_on_unknown) {
-            console.log('⚠️  Mapping non trovato, eseguo walk OID...');
-            await walkAndUpload(printerConfig.ip, printerConfig.community);
-            throw new Error('Mapping non disponibile, walk eseguito e caricato. Riprova dopo creazione mapping.');
+        // 4. Gestione intelligente mapping
+        const usingGeneric = monitor.isUsingGenericMapping();
+        
+        if (usingGeneric) {
+            console.log('⚠️  Stampante sconosciuta - uso mapping generico');
+            
+            // Step 1: Check se esiste già mapping specifico sul backend
+            const newMapping = await monitor.checkForNewMapping();
+            if (newMapping) {
+                console.log('🎉 Trovato mapping specifico! Ricarico...');
+                monitor.mapping = newMapping.mappings;
+                monitor.model.name = newMapping.name;
+            } else {
+                // Step 2: Walk OID e upload automatico (background per non bloccare)
+                console.log('🔍 Eseguo walk OID in background...');
+                monitor.walkAndUploadOids()
+                    .then(walkId => {
+                        if (walkId) {
+                            monitor.markAsUnmapped(walkId);
+                            console.log(`✅ [${printerConfig.ip}] Walk completato (ID: ${walkId})`);
+                        }
+                    })
+                    .catch(err => console.warn(`⚠️  [${printerConfig.ip}] Walk fallito: ${err.message}`));
+                
+                // Continua con mapping generico (non aspetta walk)
+                console.log('   → Procedo con dati limitati (mapping generico)');
+            }
+        } else {
+            console.log('✅ Mapping specifico:', monitor.mapping.metadata.name);
         }
 
-        // 5. Raccoglie dati
+        // 5. Raccolta dati + invio backend
         await monitor.collectData();
-
-        // 6. Submit to backend
         await monitor.submitToBackend();
 
-        return { success: true, ip: printerConfig.ip };
+        return { success: true, ip: printerConfig.ip, using_generic: usingGeneric };
 
+    } catch (error) {
+        console.error(`❌ Error monitoring ${printerConfig.ip}:`, error.message);
+        throw error;
     } finally {
         monitor.cleanup();
     }
@@ -837,8 +801,8 @@ async function walkAndUpload(host, community) {
         const walkResults = await walker.walkPrinterMib();
         console.log(`✅ Walk completato: ${Object.keys(walkResults).length} OID`);
 
-        // 4. Upload al backend (se config.schedule.upload_walks)
-        if (apiClient && config.schedule?.upload_walks) {
+        // 4. Upload al backend (sempre abilitato)
+        if (apiClient && config.upload_walks) {
             console.log('☁️  Caricamento walk sul backend...');
             
             const payload = {
@@ -894,44 +858,81 @@ async function monitorAllPrinters() {
         console.log(`📋 Trovate ${printersToMonitor.length} stampanti abilitate (${config.printers.length} totali)`);
     }
 
-    // 3. Loop su tutte le stampanti
+    // 3. Monitora tutte le stampanti in parallelo (max 3 contemporanee)
     const results = {
         success: 0,
         failed: 0,
         skipped: 0,
-        errors: []
+        errors: [],
+        total: printersToMonitor.length,
+        duration: 0
     };
 
-    for (const printerConfig of printersToMonitor) {
-        try {
-            console.log(`\n${'='.repeat(60)}`);
-            console.log(`🖨️  Monitoraggio stampante: ${printerConfig.ip}`);
-            console.log(`${'='.repeat(60)}`);
-
-            await monitorPrinter(printerConfig);
-
-            console.log(`✅ Monitoraggio completato per ${printerConfig.ip}`);
-            results.success++;
-
-        } catch (error) {
-            console.error(`❌ Errore monitoraggio ${printerConfig.ip}:`, error.message);
-            results.failed++;
-            results.errors.push({ ip: printerConfig.ip, error: error.message });
-            // Continua con prossima stampante (non bloccare)
-        }
+    const startTime = Date.now();
+    const MAX_CONCURRENT = 3; // Massimo 3 stampanti simultanee
+    
+    // Esegui in batch paralleli
+    for (let i = 0; i < printersToMonitor.length; i += MAX_CONCURRENT) {
+        const batch = printersToMonitor.slice(i, i + MAX_CONCURRENT);
+        const batchNumber = Math.floor(i / MAX_CONCURRENT) + 1;
+        const totalBatches = Math.ceil(printersToMonitor.length / MAX_CONCURRENT);
+        
+        console.log(`\n� Batch ${batchNumber}/${totalBatches} - Stampanti: ${batch.map(p => p.ip).join(', ')}`);
+        
+        // Monitora batch in parallelo
+        const batchPromises = batch.map(async (printerConfig) => {
+            try {
+                console.log(`🖨️  [${printerConfig.ip}] Avvio monitoraggio...`);
+                await monitorPrinter(printerConfig);
+                console.log(`✅ [${printerConfig.ip}] Completato`);
+                return { success: true, ip: printerConfig.ip };
+            } catch (error) {
+                console.error(`❌ [${printerConfig.ip}] Errore: ${error.message}`);
+                return { success: false, ip: printerConfig.ip, error: error.message };
+            }
+        });
+        
+        // Attendi completamento batch
+        const batchResults = await Promise.allSettled(batchPromises);
+        
+        // Elabora risultati batch
+        batchResults.forEach((result) => {
+            if (result.status === 'fulfilled') {
+                if (result.value.success) {
+                    results.success++;
+                } else {
+                    results.failed++;
+                    results.errors.push({ 
+                        ip: result.value.ip, 
+                        error: result.value.error 
+                    });
+                }
+            } else {
+                results.failed++;
+                results.errors.push({ 
+                    ip: 'unknown', 
+                    error: result.reason?.message || 'Unknown error' 
+                });
+            }
+        });
     }
+    
+    results.duration = Date.now() - startTime;
 
-    // 4. Summary
+    // 4. Summary con metriche
     console.log(`\n${'='.repeat(80)}`);
     console.log(`📊 RIEPILOGO CICLO`);
     console.log(`${'='.repeat(80)}`);
-    console.log(`   ✅ Successi: ${results.success}`);
-    console.log(`   ❌ Errori: ${results.failed}`);
-    console.log(`   ⏭️  Saltate: ${results.skipped}`);
+    console.log(`   📋 Totale: ${results.total} stampanti`);
+    console.log(`   ✅ Successi: ${results.success} (${Math.round(results.success/results.total*100)}%)`);
+    console.log(`   ❌ Errori: ${results.failed} (${Math.round(results.failed/results.total*100)}%)`);
+    console.log(`   ⏱️  Durata: ${(results.duration / 1000).toFixed(2)}s`);
+    console.log(`   🚀 Velocità: ${(results.duration / results.total / 1000).toFixed(2)}s/stampante (media)`);
+    
     if (results.errors.length > 0) {
-        console.log(`\n   Dettaglio errori:`);
+        console.log(`\n   ❌ Dettaglio errori:`);
         results.errors.forEach(e => {
-            console.log(`   • ${e.ip}: ${e.error}`);
+            console.log(`      • ${e.ip}: ${e.error}`);
         });
     }
     console.log(`${'='.repeat(80)}\n`);
@@ -944,33 +945,18 @@ async function monitorAllPrinters() {
  */
 async function main() {
     console.log('🎯 Modalità SINGLE-RUN\n');
-    
-    // Avvia heartbeat se configurato (lo fermeremo alla fine)
-    let heartbeatStarted = false;
-    if (heartbeatManager && !argv['no-heartbeat']) {
-        heartbeatManager.start();
-        heartbeatStarted = true;
-    }
 
-    try {
-        // Esegui un ciclo completo
-        await monitorAllPrinters();
-        
-        console.log('\n✅ Ciclo monitoraggio completato');
-        
-    } finally {
-        // Cleanup
-        if (heartbeatStarted && heartbeatManager) {
-            heartbeatManager.stop();
-        }
-    }
+    // Esegui un ciclo completo
+    await monitorAllPrinters();
+    
+    console.log('\n✅ Ciclo monitoraggio completato');
 }
 
 /**
  * Modalità Daemon - Esegue monitoring continuo
  */
 async function runDaemon() {
-    const intervalMinutes = config.schedule?.interval_minutes || 5;
+    const intervalMinutes = config.interval_minutes;
     const intervalMs = intervalMinutes * 60 * 1000;
     
     console.log('� MODALITÀ DAEMON ATTIVATA');
@@ -978,11 +964,6 @@ async function runDaemon() {
     console.log(`   Stampanti configurate: ${config.printers?.length || 0}`);
     console.log(`   Backend: ${config.backend_url || 'disabled'}`);
     console.log('');
-
-    // Avvia heartbeat manager (continuo)
-    if (heartbeatManager) {
-        heartbeatManager.start();
-    }
 
     // Graceful shutdown handlers
     let isShuttingDown = false;
@@ -997,11 +978,6 @@ async function runDaemon() {
         // Stop interval
         if (intervalId) {
             clearInterval(intervalId);
-        }
-        
-        // Stop heartbeat
-        if (heartbeatManager) {
-            heartbeatManager.stop();
         }
         
         console.log('✅ Agent arrestato correttamente');

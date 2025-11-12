@@ -2,7 +2,7 @@
  * API Client - Comunicazione con Backend
  * 
  * Gestisce tutte le richieste HTTP al backend con:
- * - Headers automatici (api_key, tenant_id)
+ * - Headers automatici (api_key, company_id)
  * - Retry logic
  * - Error handling
  */
@@ -13,7 +13,7 @@ class APIClient {
   constructor(config) {
     this.baseURL = config.backend_url;
     this.apiKey = config.api_key;
-    this.tenantId = config.tenant_id;
+    this.companyId = config.company_id;
     this.retryAttempts = config.retry_attempts || 3;
     this.retryDelay = config.retry_delay || 5000;
   }
@@ -30,7 +30,7 @@ class APIClient {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.apiKey,
-        'x-tenant-id': this.tenantId,
+        'x-company-id': this.companyId,
         ...options.headers,
       },
       data: options.body,

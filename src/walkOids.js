@@ -128,16 +128,53 @@ class PrinterOidWalker {
     }
 
     /**
-     * Estrae il modello dalla descrizione del sistema
+     * Estrae il modello dalla descrizione del sistema (migliorato)
      */
     extractModel(sysDescr) {
         if (!sysDescr) return 'Unknown';
         
-        // Rimuovi caratteri speciali e normalizza
+        // Pattern comuni per identificare vendor e modello
+        const patterns = [
+            // Develop ineo+ 250i
+            /Develop\s+(ineo\+?\s*\d+i?)/i,
+            // HP LaserJet
+            /HP\s+(LaserJet\s+[\w\s]+)/i,
+            // Canon imageRUNNER
+            /Canon\s+(imageRUNNER\s+[\w\s]+)/i,
+            // Xerox
+            /Xerox\s+([\w\s]+\d+)/i,
+            // Epson
+            /Epson\s+([\w\s-]+)/i,
+            // Brother
+            /Brother\s+([\w\s-]+)/i,
+            // Ricoh
+            /Ricoh\s+([\w\s]+)/i,
+            // Konica Minolta
+            /Konica\s+Minolta\s+([\w\s]+)/i,
+            // Olivetti
+            /OLIVETTI\s+([\w\s]+)/i,
+        ];
+        
+        for (const pattern of patterns) {
+            const match = sysDescr.match(pattern);
+            if (match) {
+                // Vendor + Model, pulito
+                const vendor = match[0].split(/\s+/)[0];
+                const model = match[1].trim();
+                const normalized = `${vendor}_${model}`
+                    .replace(/[^a-zA-Z0-9\s\-_+]/g, '')
+                    .replace(/\s+/g, '_');
+                return normalized;
+            }
+        }
+        
+        // Fallback: prendi prime 5 parole significative
         const cleanModel = sysDescr
             .replace(/[^a-zA-Z0-9\s\-_+]/g, '')
-            .replace(/\s+/g, '_')
-            .trim();
+            .split(/\s+/)
+            .filter(word => word.length > 2) // Ignora parole troppo corte
+            .slice(0, 5)
+            .join('_');
         
         return cleanModel || 'Unknown';
     }
@@ -183,7 +220,13 @@ class PrinterOidWalker {
 
                     try {
                         const parsedValue = this.parseOidValue(vb);
-                        results[vb.oid] = parsedValue;
+                        
+                        // Filtra OID inutili
+                        if (!this.shouldSkipOid(vb.oid, parsedValue)) {
+                            results[vb.oid] = parsedValue;
+                        } else {
+                            count--; // Non contare OID filtrati
+                        }
                     } catch (err) {
                         results[vb.oid] = {
                             error: err.message,
@@ -208,13 +251,12 @@ class PrinterOidWalker {
     }
 
     /**
-     * Parser intelligente per i valori OID
+     * Parser intelligente per i valori OID (ottimizzato)
      */
     parseOidValue(vb) {
-        let value, rawValue, type;
+        let value, type;
 
         if (Buffer.isBuffer(vb.value)) {
-            rawValue = vb.value;
             // Prova a decodificare come stringa
             const stringValue = vb.value.toString('utf8');
             
@@ -222,29 +264,51 @@ class PrinterOidWalker {
                 value = stringValue.trim();
                 type = 'string';
             } else {
-                value = vb.value.toString('hex');
-                type = 'hex';
+                // Solo hex per dati binari significativi (evita hex lunghi inutili)
+                if (vb.value.length > 100) {
+                    value = `<binary data ${vb.value.length} bytes>`;
+                    type = 'binary';
+                } else {
+                    value = vb.value.toString('hex');
+                    type = 'hex';
+                }
             }
         } else if (typeof vb.value === 'number') {
             value = vb.value;
             type = 'integer';
-            rawValue = vb.value;
         } else if (vb.value === null || vb.value === undefined) {
             value = null;
             type = 'null';
-            rawValue = null;
         } else {
             value = vb.value.toString();
             type = 'string';
-            rawValue = vb.value;
         }
 
-        return {
-            value,
-            type,
-            rawValue,
-            timestamp: new Date().toISOString()
-        };
+        return { value, type };
+    }
+
+    /**
+     * Filtra OID inutili o troppo lunghi
+     */
+    shouldSkipOid(oid, value) {
+        // Skip OID di firmware/software version troppo lunghi
+        if (value.type === 'binary') return true;
+        
+        // Skip stringhe vuote
+        if (value.type === 'string' && !value.value) return true;
+        
+        // Skip OID di metadata poco utili
+        const skipPatterns = [
+            /\.1\.3\.6\.1\.2\.1\.25\./, // Host Resources MIB (spesso verboso)
+            /\.1\.3\.6\.1\.4\.1\./, // Enterprise OIDs (troppo specifici)
+        ];
+        
+        // NON skipare Printer MIB principale
+        if (oid.startsWith('1.3.6.1.2.1.43.')) {
+            return false;
+        }
+        
+        return skipPatterns.some(pattern => pattern.test(oid));
     }
 
     /**
