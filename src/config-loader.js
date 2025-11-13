@@ -131,10 +131,9 @@ class ConfigLoader {
       }
     }
     
-    // Interval Minutes
+    // Interval Minutes (FLAT schema)
     if (process.env.INTERVAL_MINUTES) {
-      overrides.schedule = overrides.schedule || config.schedule || {};
-      overrides.schedule.interval_minutes = parseInt(process.env.INTERVAL_MINUTES, 10);
+      overrides.interval_minutes = parseInt(process.env.INTERVAL_MINUTES, 10);
       hasOverrides = true;
       console.log('   🔀 Override: INTERVAL_MINUTES from env');
     }
@@ -217,9 +216,9 @@ class ConfigLoader {
       });
     }
     
-    // Schedule
-    if (config.schedule.interval_minutes < 1) {
-      errors.push('schedule.interval_minutes must be >= 1');
+    // Interval Minutes (FLAT schema)
+    if (!config.interval_minutes || config.interval_minutes < 1) {
+      errors.push('interval_minutes must be >= 1');
     }
     
     if (errors.length > 0) {
@@ -243,7 +242,7 @@ class ConfigLoader {
     const enabledCount = config.printers.filter(p => p.enabled !== false).length;
     console.log(`   Enabled: ${enabledCount}/${config.printers.length}`);
     
-    console.log(`   Interval: ${config.schedule.interval_minutes} minutes`);
+    console.log(`   Interval: ${config.interval_minutes} minutes`);
     console.log('');
   }
   

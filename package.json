@@ -25,9 +25,7 @@
   "license": "MIT",
   "dependencies": {
     "axios": "^1.7.7",
-    "cheerio": "^1.1.2",
     "minimist": "^1.2.8",
-    "net-snmp": "^3.12.1",
-    "puppeteer": "^24.20.0"
+    "net-snmp": "^3.12.1"
   }
 }

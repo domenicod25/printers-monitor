@@ -1,0 +1,16 @@
+{
+  "backend_url": "http://localhost:3000/v1",
+  "api_key": "agent_45dc86ba137ea73c8954675467afdf96",
+  "company_id": "2b999e52-d67c-41b1-a772-c22a20db4abd",
+  "printers": [
+    {
+      "ip": "192.168.180.141",
+      "community": "public"
+    },
+    {
+      "ip": "192.168.180.140",
+      "community": "public"
+    }
+  ],
+  "interval_minutes": 5
+}

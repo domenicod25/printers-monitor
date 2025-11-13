@@ -1,0 +1,16 @@
+{
+  "backend_url": "https://api.example.com/v1",
+  "api_key": "agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "company_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "printers": [
+    {
+      "ip": "192.168.1.100",
+      "community": "public"
+    },
+    {
+      "ip": "192.168.1.101",
+      "community": "public"
+    }
+  ],
+  "interval_minutes": 5
+}
