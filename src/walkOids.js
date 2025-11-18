@@ -180,6 +180,112 @@ class PrinterOidWalker {
     }
 
     /**
+     * Walk multiple root OIDs and merge results (NEW v3.0)
+     * @param {string[]} rootOids - Array of root OIDs to walk
+     * @returns {Promise<Object>} - Merged walk results
+     */
+    async walkMultipleRoots(rootOids) {
+        console.log(`🚶 Walk multipli root OIDs (${rootOids.length} roots)...`);
+        
+        const allResults = {};
+        let totalCount = 0;
+        const errors = [];
+        
+        // Walk each root OID sequentially
+        for (const rootOid of rootOids) {
+            try {
+                console.log(`   Walking ${rootOid}...`);
+                const walkResult = await this.walkSingleRoot(rootOid);
+                
+                // Merge results
+                Object.assign(allResults, walkResult.results);
+                totalCount += walkResult.count;
+                
+                if (walkResult.error) {
+                    errors.push({ oid: rootOid, error: walkResult.error });
+                }
+                
+            } catch (error) {
+                console.error(`   ❌ Errore walking ${rootOid}: ${error.message}`);
+                errors.push({ oid: rootOid, error: error.message });
+            }
+        }
+        
+        console.log(`✅ Walk multipli completato: ${totalCount} OID totali`);
+        if (errors.length > 0) {
+            console.warn(`⚠️  ${errors.length} root OID con errori`);
+        }
+        
+        return {
+            results: allResults,
+            error: errors.length > 0 ? errors : null,
+            count: totalCount
+        };
+    }
+
+    /**
+     * Walk a single root OID
+     * @param {string} rootOid - Root OID to walk
+     * @returns {Promise<Object>} - Walk results
+     */
+    async walkSingleRoot(rootOid) {
+        return new Promise((resolve) => {
+            const results = {};
+            let count = 0;
+            let hasError = false;
+
+            const errorHandler = (error) => {
+                if (!hasError) {
+                    hasError = true;
+                    console.error(`   ❌ Errore durante walk ${rootOid}: ${error.message}`);
+                    resolve({ results, error: error.message, count });
+                }
+            };
+
+            this.session.once('error', errorHandler);
+
+            this.session.subtree(
+                rootOid,
+                (varbindArray) => {
+                    if (!varbindArray || varbindArray.length === 0 || hasError) return;
+
+                    const vb = varbindArray[0];
+                    count++;
+
+                    if (snmp.isVarbindError(vb)) {
+                        results[vb.oid] = {
+                            error: snmp.varbindError(vb),
+                            type: 'error'
+                        };
+                        return;
+                    }
+
+                    try {
+                        const parsedValue = this.parseOidValue(vb);
+                        
+                        if (!this.shouldSkipOid(vb.oid, parsedValue)) {
+                            results[vb.oid] = parsedValue;
+                        } else {
+                            count--;
+                        }
+                    } catch (err) {
+                        results[vb.oid] = {
+                            error: err.message,
+                            type: 'parse_error'
+                        };
+                    }
+                },
+                (error) => {
+                    if (!hasError) {
+                        this.session.removeListener('error', errorHandler);
+                        resolve({ results, error: error ? error.message : null, count });
+                    }
+                }
+            );
+        });
+    }
+
+    /**
      * Esegue il walk del Printer MIB (.43)
      */
     async walkPrinterMib() {

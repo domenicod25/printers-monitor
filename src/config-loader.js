@@ -33,14 +33,17 @@ class ConfigLoader {
       throw new Error('❌ No configuration found! Expected embedded-config.json or configs/config.json');
     }
     
+    console.log('   🔄 Applying environment overrides...');
     // 2. Applica override da environment variables
     config = this.applyEnvOverrides(config);
     
-    // 3. Normalizza schema (supporta backward compatibility)
-    config = this.normalizeSchema(config);
+    console.log('   🔄 Validating configuration (before normalization)...');
+    // 3. Valida configurazione RAW (prima della normalizzazione)
+    this.validateRawConfig(config);
     
-    // 4. Valida configurazione
-    this.validateConfig(config);
+    console.log('   🔄 Normalizing schema...');
+    // 4. Normalizza schema (converte nested schedule in flat)
+    config = this.normalizeSchema(config);
     
     console.log('✅ Configuration loaded successfully');
     this.logConfigSummary(config);
@@ -142,17 +145,17 @@ class ConfigLoader {
   }
   
   /**
-   * Normalizza schema SEMPLIFICATO
-   * Backend genera solo: backend_url, api_key, company_id, printers[], interval_minutes
+   * Normalizza schema STANDARD (NESTED schedule)
+   * Backend genera: backend_url, api_key, company_id, printers[], schedule: { interval_minutes, walk_on_unknown, upload_walks }
    * Agent aggiunge defaults intelligenti
    */
   static normalizeSchema(config) {
     const normalized = {};
     
     // === Dati OBBLIGATORI dal backend ===
-    normalized.backend_url = config.backend_url || config.backend?.url;
-    normalized.api_key = config.api_key || config.backend?.api_key;
-    normalized.company_id = config.company_id || config.backend?.company_id || config.backend?.tenant_id;
+    normalized.backend_url = config.backend_url;
+    normalized.api_key = config.api_key;
+    normalized.company_id = config.company_id;
     
     // Printers (normalizza con defaults)
     normalized.printers = (config.printers || []).map(p => ({
@@ -161,23 +164,28 @@ class ConfigLoader {
       enabled: p.enabled !== false // Default: tutte abilitate se non esplicitamente false
     }));
     
-    // === Configurazione AGENT (defaults) ===
-    normalized.interval_minutes = config.interval_minutes || config.schedule?.interval_minutes || 5;
+    // === Configurazione AGENT (NESTED schedule - standard unico) ===
+    if (!config.schedule) {
+      throw new Error('Configuration missing required field: schedule');
+    }
+    
+    normalized.interval_minutes = config.schedule.interval_minutes || 5;
+    normalized.walk_on_unknown = config.schedule.walk_on_unknown !== false; // Default: true
+    normalized.upload_walks = config.schedule.upload_walks !== false; // Default: true
+    
+    // Agent internal config
     normalized.retry_attempts = config.retry_attempts || 3;
     normalized.retry_delay = config.retry_delay || 5000;
-    
-    // Features agent (sempre abilitate, non configurabili da UI)
-    normalized.walk_on_unknown = true;  // Auto-discovery stampanti sconosciute
-    normalized.upload_walks = true;     // Upload walk data per mapping
     normalized.check_new_mappings = true; // Check periodico nuovi mapping
     
     return normalized;
   }
   
   /**
-   * Valida configurazione
+   * Valida configurazione RAW (prima della normalizzazione)
+   * Valida il formato con schedule nested
    */
-  static validateConfig(config) {
+  static validateRawConfig(config) {
     const errors = [];
     
     // Backend URL
@@ -216,9 +224,13 @@ class ConfigLoader {
       });
     }
     
-    // Interval Minutes (FLAT schema)
-    if (!config.interval_minutes || config.interval_minutes < 1) {
-      errors.push('interval_minutes must be >= 1');
+    // Schedule configuration (NESTED - standard unico)
+    if (!config.schedule) {
+      errors.push('schedule configuration is required');
+    } else {
+      if (!config.schedule.interval_minutes || config.schedule.interval_minutes < 1) {
+        errors.push('schedule.interval_minutes must be >= 1');
+      }
     }
     
     if (errors.length > 0) {

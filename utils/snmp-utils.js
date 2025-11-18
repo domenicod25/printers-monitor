@@ -465,6 +465,6 @@ class Utils {
 
 module.exports = {
     SNMPManager,
-    MappingManager,
+    // MappingManager, // DEPRECATED: Removed in v2.0 (Backend is Single Source of Truth)
     Utils
 };

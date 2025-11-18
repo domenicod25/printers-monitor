@@ -444,11 +444,37 @@ class DataCollector {
   }
 }
 
+/**
+ * Mapping Loader
+ * Carica mapping JSON dalla cartella mappings/
+ */
+class MappingLoader {
+  /**
+   * Carica un mapping dal file JSON
+   * @param {string} name - Nome del mapping (es. 'generic_printer')
+   * @returns {Object} Mapping object con metadata e mappings
+   */
+  static load(name) {
+    const fs = require('fs');
+    const path = require('path');
+    
+    const mappingPath = path.join(__dirname, '..', 'mappings', `${name}.json`);
+    
+    if (!fs.existsSync(mappingPath)) {
+      throw new Error(`Mapping not found: ${name} (path: ${mappingPath})`);
+    }
+    
+    const mappingData = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
+    return mappingData;
+  }
+}
+
 module.exports = {
   DataCollector,
   BasicDataProcessor,
   TonerDataProcessor,
   PaperDataProcessor,
   CountersDataProcessor,
-  StatusDataProcessor
+  StatusDataProcessor,
+  MappingLoader
 };
