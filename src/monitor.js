@@ -1,26 +1,27 @@
 #!/usr/bin/env node
 /**
- * Printer Monitor - Sistema di Monitoraggio Stampanti
+ * Printer Monitor - REFACTORED VERSION v3.0
  * 
- * Questo script rileva automaticamente il modello della stampante,
- * carica il mapping appropriato ed estrae i dati specifici.
- * 
- * Usage: 
- *   node src/monitor.js --host <IP> [options]
- *   node src/monitor.js --host 192.168.180.141 --output json
- *   node src/monitor.js --host 192.168.180.141 --format detailed --save
+ * NEW ARCHITECTURE (v3.0):
+ * - Backend is SINGLE SOURCE OF TRUTH
+ * - Agent calls /agent/scan-config at startup (bootstrap with cache)
+ * - Backend determines device status: discovered, operational, walk_requested
+ * - Walk is "one-shot": executed ONLY when status requires it
+ * - Walk UNA VOLTA in discovered (automatico), poi walk_enabled=false
+ * - Walk UNA VOLTA in walk_requested (richiesto dealer), poi walk_enabled=false
+ * - NO walk in operational (stato normale, 99% del tempo)
+ * - Bootstrap cache TTL: 5 minuti
  */
 
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const argv = require('minimist')(process.argv.slice(2));
-const { SNMPManager, MappingManager, Utils } = require('../utils/snmp-utils');
+const { SNMPManager, Utils } = require('../utils/snmp-utils');
 const APIClient = require('./api-client');
 const ConfigLoader = require('./config-loader');
 
 // ============================================
-// CONFIGURATION LOADING (UNIFIED)
+// CONFIGURATION LOADING
 // ============================================
 let config;
 try {
@@ -40,28 +41,105 @@ const apiClient = new APIClient({
 });
 
 console.log('🔗 API Client initialized');
+console.log('🎯 Architecture: Backend as Single Source of Truth\n');
+
+// ============================================
+// BOOTSTRAP CACHE (NEW ARCHITECTURE v3.0)
+// ============================================
+let SCAN_CONFIG_CACHE = null;
+let SCAN_CONFIG_TIMESTAMP = null;
+const SCAN_CONFIG_TTL = 5 * 60 * 1000; // 5 minuti cache
+
+/**
+ * Bootstrap: Get scan configuration for all devices (with cache)
+ * Replaces per-device mapping-strategy calls
+ */
+async function bootstrapScanConfig(devices) {
+    const now = Date.now();
+    
+    // Return cached config if still valid
+    if (SCAN_CONFIG_CACHE && SCAN_CONFIG_TIMESTAMP && (now - SCAN_CONFIG_TIMESTAMP < SCAN_CONFIG_TTL)) {
+        console.log('📦 Usando configurazione cache (età: ' + Math.floor((now - SCAN_CONFIG_TIMESTAMP) / 1000) + 's)');
+        return SCAN_CONFIG_CACHE;
+    }
+    
+    console.log('🔄 Richiesta nuova configurazione al backend...');
+    
+    try {
+        const payload = {
+            company_id: config.company_id,
+            api_key: config.api_key,
+            devices: devices.map(d => ({
+                ip: d.ip,
+                last_walk_at: undefined, // TODO: potremmo tracciare localmente
+            }))
+        };
+        
+        const response = await apiClient.post('/agent/scan-config', payload);
+        
+        // Cache response
+        SCAN_CONFIG_CACHE = response.devices;
+        SCAN_CONFIG_TIMESTAMP = now;
+        
+        console.log(`✅ Configurazione ricevuta per ${response.devices.length} devices`);
+        
+        // Log stats
+        const statusCounts = {};
+        response.devices.forEach(d => {
+            statusCounts[d.status] = (statusCounts[d.status] || 0) + 1;
+        });
+        console.log('   Status:', JSON.stringify(statusCounts));
+        
+        return SCAN_CONFIG_CACHE;
+        
+    } catch (error) {
+        console.error('❌ Errore bootstrap config:', error.message);
+        // Fallback: use old cache if available
+        if (SCAN_CONFIG_CACHE) {
+            console.warn('⚠️  Usando cache obsoleta come fallback');
+            return SCAN_CONFIG_CACHE;
+        }
+        throw error;
+    }
+}
+
+/**
+ * Get device configuration from cache
+ */
+function getDeviceConfig(ip) {
+    if (!SCAN_CONFIG_CACHE) {
+        throw new Error('Scan config not loaded - call bootstrapScanConfig first');
+    }
+    
+    const config = SCAN_CONFIG_CACHE.find(d => d.ip === ip);
+    if (!config) {
+        throw new Error(`Device ${ip} not found in scan config`);
+    }
+    
+    return config;
+}
 // ============================================
 
 
 class PrinterMonitor {
     constructor(host, options = {}) {
         this.host = host;
+        this.config = config;
         this.options = {
             community: options.community || 'public',
             timeout: options.timeout || 10000,
             retries: options.retries || 2,
-            format: options.format || 'summary', // summary, detailed, raw
             save: options.save || false,
             outputDir: options.outputDir || './output'
         };
         
         this.snmp = null;
-        this.mappingManager = null;
         this.printerInfo = {};
         this.model = null;
-        this.mapping = null;
+        this.vendor = null;
+        this.mapping = null; // Received from backend
         this.data = {};
-        this.apiClient = options.apiClient || null; // API Client per backend
+        this.apiClient = options.apiClient || null;
     }
 
     /**
@@ -76,21 +154,24 @@ class PrinterMonitor {
             retries: this.options.retries
         });
 
-        // Inizializza Mapping Manager
-        this.mappingManager = new MappingManager();
-
         // Test connessione
         await this.snmp.testConnection();
         console.log('✅ Connessione SNMP stabilita');
     }
 
     /**
-     * Identifica la stampante
+     * Get basic printer identification (model, vendor, sysDescr)
+     * Used to request mapping strategy from backend
      */
-    async identifyPrinter() {
-        console.log('🔍 Identificazione stampante in corso...');
+    async getBasicIdentification() {
+        console.log('🔍 Raccolta informazioni base stampante...');
         
-        const identificationOids = this.mappingManager.config.identification_oids;
+        const identificationOids = {
+            sysDescr: '1.3.6.1.2.1.1.1.0',
+            sysObjectID: '1.3.6.1.2.1.1.2.0',
+            prtGeneralSerialNumber: '1.3.6.1.2.1.43.5.1.1.17.1',
+        };
+        
         const results = await this.snmp.get(Object.values(identificationOids));
         
         // Estrai informazioni base
@@ -102,49 +183,149 @@ class PrinterMonitor {
             }
         }
 
-        // Identifica modello
         const sysDescr = this.printerInfo.sysDescr;
-        this.model = this.mappingManager.identifyPrinter(sysDescr);
         
-        if (!this.model) {
-            throw new Error(`Unable to identify printer model from: ${sysDescr}`);
-        }
+        // Extract model and vendor from sysDescr (basic parsing)
+        this.model = this.extractModel(sysDescr);
+        this.vendor = this.extractVendor(sysDescr);
 
-        console.log(`📋 Stampante identificata: ${this.model.name} (${this.model.vendor})`);
-        console.log(`   Descrizione: ${sysDescr}`);
+        console.log(`📋 Info stampante:`);
+        console.log(`   Model: ${this.model || 'Unknown'}`);
+        console.log(`   Vendor: ${this.vendor || 'Unknown'}`);
+        console.log(`   SysDescr: ${sysDescr}`);
         
         if (this.printerInfo.prtGeneralSerialNumber) {
             console.log(`   Seriale: ${this.printerInfo.prtGeneralSerialNumber}`);
         }
         
-        return this.model;
+        return {
+            model: this.model,
+            vendor: this.vendor,
+            sys_descr: sysDescr,
+        };
     }
 
     /**
-     * Carica il mapping per il modello identificato
+     * Extract model from sysDescr (basic parsing)
      */
-    loadMapping() {
-        console.log(`📁 Caricamento mapping per ${this.model.name}...`);
+    extractModel(sysDescr) {
+        if (!sysDescr) return null;
         
-        this.mapping = this.mappingManager.loadMapping(this.model.name);
+        // Try to extract model name (e.g., "Develop ineo+ 250i" from description)
+        const patterns = [
+            /(?:Model|MODELO|model)[\s:]+([^,;\n]+)/i,
+            /(ineo\+\s+\d+i)/i,  // Develop ineo+ 250i, ineo+ 450i, etc.
+            /(ineo[+\s]+[^\s,;]+)/i,  // Generic ineo models
+            /(MFC-[^\s,;]+)/i,
+            /(OfficeJet[^\s,;]+)/i,
+        ];
         
-        if (!this.mapping) {
-            throw new Error(`Failed to load mapping for ${this.model.name}`);
+        for (const pattern of patterns) {
+            const match = sysDescr.match(pattern);
+            if (match) {
+                return match[1].trim();
+            }
         }
-
-        console.log(`✅ Mapping caricato: ${this.mapping.metadata.displayName}`);
-        return this.mapping;
+        
+        // Fallback: first part of sysDescr
+        return sysDescr.split(',')[0].split(';')[0].trim();
     }
 
     /**
-     * Raccoglie tutti i dati secondo il mapping
-     * Usa DataCollector per separazione responsabilità
+     * Extract vendor from sysDescr
+     */
+    extractVendor(sysDescr) {
+        if (!sysDescr) return 'Unknown';
+        
+        const vendors = ['Develop', 'HP', 'Canon', 'Brother', 'Epson', 'Xerox', 'Samsung', 'Ricoh', 'Konica Minolta', 'Lexmark'];
+        
+        for (const vendor of vendors) {
+            if (sysDescr.toLowerCase().includes(vendor.toLowerCase())) {
+                return vendor;
+            }
+        }
+        
+        return 'Unknown';
+    }
+
+    /**
+     * Perform full SNMP walk and upload to backend
+     * @param {Object} identification - Device identification info
+     * @param {string[]} rootOids - Array of root OIDs to walk (optional)
+     */
+    async performWalkAndUpload(identification, rootOids = null) {
+        console.log('🚶 Esecuzione walk OID...');
+        
+        const { PrinterOidWalker } = require('./walkOids');
+        
+        const walker = new PrinterOidWalker(this.host, this.options.community);
+        walker.createSession();
+
+        try {
+            // 1. Test connessione
+            await walker.testConnection();
+
+            // 2. Walk OIDs (multi-root support)
+            let walkResults;
+            if (rootOids && rootOids.length > 0) {
+                console.log(`   Walking ${rootOids.length} root OIDs: ${rootOids.join(', ')}`);
+                walkResults = await walker.walkMultipleRoots(rootOids);
+            } else {
+                console.log('   Walking default Printer MIB');
+                walkResults = await walker.walkPrinterMib();
+            }
+            
+            console.log(`✅ Walk completato: ${Object.keys(walkResults).length} OID`);
+
+            // 3. Upload al backend
+            console.log('☁️  Caricamento walk sul backend...');
+            
+            const payload = {
+                device_ip: this.host,
+                model: identification.model || 'Unknown',
+                vendor: identification.vendor || 'Unknown',
+                sys_descr: identification.sys_descr,
+                walk_data: walkResults,
+            };
+
+            const response = await this.apiClient.post('/telemetry/walks', payload);
+            console.log('✅ Walk caricato con successo');
+            console.log(`   Walk ID: ${response.walk_id}`);
+            console.log(`   Device status: ${response.status}`);
+
+            return response.walk_id;
+            
+        } catch (error) {
+            console.error('❌ Errore durante walk:', error.message);
+            throw error;
+        } finally {
+            walker.close();
+        }
+    }
+
+    /**
+     * Raccoglie tutti i dati secondo il mapping ricevuto dal backend
      */
     async collectData() {
         console.log('📊 Raccolta dati in corso...');
         
+        if (!this.mapping) {
+            throw new Error('No mapping available - cannot collect data');
+        }
+        
         const { DataCollector } = require('./data-processors');
-        const collector = new DataCollector(this.snmp, this.mapping);
+        
+        // Adatta mapping format per DataCollector
+        const mappingFormat = {
+            metadata: {
+                name: this.model || 'unknown',
+                displayName: this.model || 'Unknown Printer',
+                vendor: this.vendor || 'Unknown',
+            },
+            mappings: this.mapping,
+        };
+        
+        const collector = new DataCollector(this.snmp, mappingFormat);
         
         // Raccoglie e processa dati
         const collectedData = await collector.collect();
@@ -154,78 +335,39 @@ class PrinterMonitor {
             metadata: {
                 ...collectedData.metadata,
                 host: this.host,
-                model: this.model
+                model: this.model,
+                vendor: this.vendor,
             },
             basic: collectedData.basic,
             status: collectedData.status,
             toner: collectedData.toner,
             paper: collectedData.paper,
             counters: collectedData.counters,
-            raw: this.options.format === 'raw' ? collectedData.raw : undefined
         };
-        
-        // Pulisci undefined
-        Object.keys(this.data).forEach(key => {
-            if (this.data[key] === undefined) {
-                delete this.data[key];
-            }
-        });
 
         return this.data;
-    }
-
-    /**
-     * Salva i risultati su file
-     */
-    async saveResults() {
-        if (!this.options.save) {
-            return null;
-        }
-
-        const filename = `${this.model.name}_${this.host.replace(/\./g, '_')}_${Utils.timestamp()}.json`;
-        const filepath = path.join(this.options.outputDir, filename);
-
-        // Crea directory se non esiste
-        if (!fs.existsSync(this.options.outputDir)) {
-            fs.mkdirSync(this.options.outputDir, { recursive: true });
-        }
-
-        fs.writeFileSync(filepath, JSON.stringify(this.data, null, 2));
-        console.log(`💾 Dati salvati in: ${filepath}`);
-
-        return filepath;
     }
 
     /**
      * Submit telemetry data to backend API
      */
     async submitToBackend() {
-        // Check if backend integration is enabled
-        const backendConfig = this.mappingManager.config.backend;
-        if (!backendConfig || !backendConfig.enabled) {
-            console.log('ℹ️  Backend integration disabled');
-            return null;
-        }
+        console.log(`📤 Invio telemetry al backend...`);
 
-        console.log(`📤 Submitting telemetry to backend...`);
-
-        const url = `${backendConfig.url}/telemetry`;
-        
         // Prepare payload matching SubmitTelemetryDto
         const payload = {
             device: {
                 ip_address: this.host,
                 serial_number: this.printerInfo.prtGeneralSerialNumber || undefined,
-                model: this.model.name,
-                vendor: this.model.vendor,
-                mac_address: undefined // TODO: Extract from SNMP if available
+                model: this.model || 'Unknown',
+                vendor: this.vendor || 'Unknown',
+                mac_address: undefined,
             },
             telemetry: {
                 toner_levels: this.extractTonerLevels(),
                 paper_levels: this.extractPaperLevels(),
                 status_info: this.extractStatusInfo(),
                 counters: this.extractCounters(),
-                raw_snmp_data: this.options.format === 'raw' ? this.data : undefined
             },
             collection_metadata: {
                 successful_oids: this.data.metadata?.successful_oids,
@@ -234,485 +376,108 @@ class PrinterMonitor {
             collected_at: new Date().toISOString()
         };
 
-        // Retry logic
-        let lastError;
-        for (let attempt = 1; attempt <= backendConfig.retry_attempts; attempt++) {
-            try {
-                const response = await axios.post(url, payload, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-company-id': backendConfig.company_id,
-                        'x-agent-version': backendConfig.agent_version,
-                        'Authorization': `Bearer ${backendConfig.api_key}`
-                    },
-                    timeout: 30000,
-                    validateStatus: () => true // Non lanciare errore automaticamente
-                });
-
-                if (response.status >= 400) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText || 'Error'}`);
-                }
-
-                const result = response.data;
-                console.log(`✅ Telemetry submitted successfully`);
-                console.log(`   Device ID: ${result.device_id}`);
-                console.log(`   Telemetry ID: ${result.telemetry_id}`);
-                if (result.alerts_generated > 0) {
-                    console.log(`   ⚠️  Alerts generated: ${result.alerts_generated}`);
-                }
-
-                return result;
-
-            } catch (error) {
-                lastError = error;
-                console.log(`   ⚠️  Attempt ${attempt}/${backendConfig.retry_attempts} failed: ${error.message}`);
-                
-                if (attempt < backendConfig.retry_attempts) {
-                    console.log(`   ⏳ Retrying in ${backendConfig.retry_delay}ms...`);
-                    await new Promise(resolve => setTimeout(resolve, backendConfig.retry_delay));
-                }
-            }
+        try {
+            const response = await this.apiClient.post('/telemetry', payload);
+            console.log('✅ Telemetry inviato con successo');
+            return response;
+        } catch (error) {
+            console.error('❌ Errore invio telemetry:', error.message);
+            throw error;
         }
-
-        console.error(`❌ Failed to submit telemetry after ${backendConfig.retry_attempts} attempts`);
-        console.error(`   Last error: ${lastError.message}`);
-        return null;
     }
 
     /**
      * Extract toner levels from collected data
      */
     extractTonerLevels() {
-        const toner = {};
-        if (this.data.toner) {
-            for (const [color, info] of Object.entries(this.data.toner)) {
-                if (info.percentage !== undefined) {
-                    toner[color.toLowerCase()] = Math.round(info.percentage);
-                }
+        if (!this.data.toner) {
+            return {};
+        }
+
+        const levels = {};
+        // DataCollector returns toner directly with colors (not nested in .supplies)
+        for (const [color, supply] of Object.entries(this.data.toner)) {
+            if (supply && supply.level !== undefined) {
+                levels[color] = {
+                    level: supply.level,
+                    max_capacity: supply.capacity,
+                    percentage: supply.percentage,
+                    status: supply.status,
+                };
             }
         }
-        return Object.keys(toner).length > 0 ? toner : undefined;
+        return levels;
     }
 
     /**
      * Extract paper levels from collected data
      */
     extractPaperLevels() {
-        const paper = {};
-        if (this.data.paper) {
-            for (const [tray, info] of Object.entries(this.data.paper)) {
-                if (info.current !== undefined) {
-                    paper[tray] = {
-                        current: info.current,
-                        capacity: info.capacity || 0
-                    };
-                }
+        if (!this.data.paper) {
+            return {};
+        }
+
+        const levels = {};
+        // DataCollector returns paper directly with trays (not nested in .trays)
+        for (const [tray, info] of Object.entries(this.data.paper)) {
+            if (info && info.current !== undefined) {
+                levels[tray] = {
+                    capacity: info.capacity,
+                    current_level: info.current,
+                    media_type: info.media_type,
+                    status: info.status,
+                };
             }
         }
-        return Object.keys(paper).length > 0 ? paper : undefined;
+        return levels;
     }
 
     /**
      * Extract status info from collected data
      */
     extractStatusInfo() {
-        const status = {};
-        if (this.data.status) {
-            status.printer_status = this.data.status.printer_status?.value || 'unknown';
-            if (this.data.status.printer_status?.displayValue) {
-                status.detailed_status = this.data.status.printer_status.displayValue;
-            }
+        if (!this.data.status) {
+            return {};
         }
-        return Object.keys(status).length > 0 ? status : undefined;
+
+        return {
+            device_status: this.data.status.device_status,
+            device_errors: this.data.status.device_errors || [],
+            printer_status: this.data.status.printer_status,
+            detailed_status: this.data.status.detailed_status,
+        };
     }
 
     /**
      * Extract counters from collected data
      */
     extractCounters() {
-        const counters = {};
-        if (this.data.counters) {
-            if (this.data.counters.total_pages?.value !== undefined) {
-                counters.total_pages = parseInt(this.data.counters.total_pages.value);
-            }
-            if (this.data.counters.color_pages?.value !== undefined) {
-                counters.color_pages = parseInt(this.data.counters.color_pages.value);
-            }
-            if (this.data.counters.mono_pages?.value !== undefined) {
-                counters.mono_pages = parseInt(this.data.counters.mono_pages.value);
-            }
+        if (!this.data.counters) {
+            return {};
         }
-        return Object.keys(counters).length > 0 ? counters : undefined;
+
+        return {
+            total_pages: this.data.counters.total_pages,
+            black_pages: this.data.counters.black_pages,
+            color_pages: this.data.counters.color_pages,
+            total_impressions: this.data.counters.total_impressions,
+        };
     }
 
     /**
-     * Salva i risultati su file
-     */
-    async saveResults_OLD() {
-        if (!this.options.save) return null;
-
-        // Crea directory di output se non esiste
-        if (!fs.existsSync(this.options.outputDir)) {
-            fs.mkdirSync(this.options.outputDir, { recursive: true });
-        }
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = `${Utils.normalizeModelName(this.model.name)}_${this.host.replace(/\./g, '_')}_${timestamp}.json`;
-        const filepath = path.join(this.options.outputDir, filename);
-
-        fs.writeFileSync(filepath, JSON.stringify(this.data, null, 2));
-        
-        console.log(`💾 Risultati salvati in: ${filename}`);
-        return filepath;
-    }
-
-    /**
-     * Formatta l'output per la console
-     */
-    formatOutput() {
-        const format = this.options.format;
-        
-        if (format === 'raw') {
-            return JSON.stringify(this.data, null, 2);
-        }
-        
-        if (format === 'summary') {
-            return this.formatSummary();
-        }
-        
-        if (format === 'detailed') {
-            return this.formatDetailed();
-        }
-        
-        // Default: JSON pretty
-        return JSON.stringify(this.data, null, 2);
-    }
-
-    /**
-     * Formato summary per console
-     */
-    formatSummary() {
-        const lines = [];
-        
-        lines.push(`\n${'='.repeat(60)}`);
-        lines.push(`📊 RIEPILOGO STAMPANTE`);
-        lines.push(`${'='.repeat(60)}`);
-        
-        // Info base
-        lines.push(`🖨️  Modello: ${this.data.metadata.model.name}`);
-        lines.push(`🏢 Vendor: ${this.data.metadata.model.vendor}`);
-        lines.push(`🌐 Host: ${this.host}`);
-        
-        if (this.data.basic?.serialNumber?.value) {
-            lines.push(`🔢 Seriale: ${this.data.basic.serialNumber.value}`);
-        }
-
-        // Status
-        if (this.data.status?.printerStatus?.displayValue) {
-            lines.push(`📋 Stato: ${this.data.status.printerStatus.displayValue}`);
-        }
-
-        // Toner
-        lines.push(`\n🎨 TONER:`);
-        for (const [color, info] of Object.entries(this.data.toner || {})) {
-            if (info.percentage !== undefined) {
-                const status = info.status === 'critical' ? '🔴' : 
-                             info.status === 'low' ? '🟡' : '🟢';
-                lines.push(`   ${status} ${color}: ${info.percentage}%`);
-            }
-        }
-
-        // Carta
-        lines.push(`\n📄 CARTA:`);
-        for (const [tray, info] of Object.entries(this.data.paper || {})) {
-            if (info.current !== undefined) {
-                const status = info.status === 'empty' ? '🔴' : 
-                             info.status === 'low' ? '🟡' : '🟢';
-                const display = info.capacity ? 
-                    `${info.current}/${info.capacity} (${info.percentage}%)` : 
-                    `${info.current}`;
-                lines.push(`   ${status} ${tray}: ${display}`);
-            }
-        }
-
-        lines.push(`\n⏰ Aggiornato: ${new Date(this.data.metadata.timestamp).toLocaleString()}`);
-        lines.push(`${'='.repeat(60)}`);
-        
-        return lines.join('\n');
-    }
-
-    /**
-     * Formato dettagliato per console
-     */
-    formatDetailed() {
-        return JSON.stringify(this.data, null, 2);
-    }
-
-    /**
-     * Cleanup
+     * Cleanup resources
      */
     cleanup() {
         if (this.snmp) {
             this.snmp.close();
         }
     }
-
-    /**
-     * Invia dati raccolti al backend
-     */
-    async submitToBackend() {
-        if (!this.apiClient) {
-            console.log('⚠️  No API client configured, skipping backend submission');
-            return;
-        }
-
-        console.log('📤 Submitting telemetry to backend...');
-
-        try {
-            const os = require('os');
-            const payload = {
-                device: {
-                    ip_address: this.host,
-                    model: this.model.name,
-                    vendor: this.model.vendor,
-                    serial_number: this.printerInfo.prtGeneralSerialNumber || null,
-                    mac_address: null, // TODO: Extract from SNMP if available
-                },
-                telemetry: {
-                    toner_levels: this.extractTonerLevels(),
-                    paper_levels: this.extractPaperLevels(),
-                    counters: this.extractCounters(),
-                    status_info: this.extractStatus(),
-                },
-                collection_metadata: {
-                    successful_oids: this.data.metadata?.successful_oids,
-                    total_oids: this.data.metadata?.total_oids,
-                },
-                // Metadata agent (consolidato da ex-heartbeat)
-                agent: {
-                    hostname: os.hostname(),
-                    platform: os.platform(),
-                    os_version: os.release(),
-                    agent_version: '1.0.0',
-                    uptime_seconds: Math.floor(process.uptime()),
-                    memory_usage_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-                },
-                collected_at: new Date().toISOString(),
-            };
-
-            // Debug: log payload in development
-            if (process.env.DEBUG_TELEMETRY) {
-                console.log('📋 Telemetry payload:', JSON.stringify(payload, null, 2));
-            }
-
-            await this.apiClient.post('/telemetry', payload);
-            console.log('✅ Telemetry submitted (includes agent metadata)');
-        } catch (error) {
-            console.error('❌ Failed to submit telemetry:', error.message);
-            // Non blocca l'agent, continua
-        }
-    }
-
-    /**
-     * Estrae livelli toner per il backend
-     */
-    extractTonerLevels() {
-        const toner = this.data.toner || {};
-        return Object.entries(toner).reduce((acc, [color, data]) => {
-            if (data.percentage !== undefined) {
-                acc[color] = data.percentage;
-            }
-            return acc;
-        }, {});
-    }
-
-    /**
-     * Estrae livelli carta per il backend
-     */
-    extractPaperLevels() {
-        const paper = this.data.paper || {};
-        return Object.entries(paper).reduce((acc, [tray, data]) => {
-            if (data.current !== undefined) {
-                acc[tray] = {
-                    current: data.current,
-                    capacity: data.capacity || null,
-                };
-            }
-            return acc;
-        }, {});
-    }
-
-    /**
-     * Estrae contatori per il backend
-     */
-    extractCounters() {
-        const counters = this.data.counters || {};
-        return Object.entries(counters).reduce((acc, [key, data]) => {
-            if (data.value !== undefined) {
-                acc[key] = data.value;
-            }
-            return acc;
-        }, {});
-    }
-
-    /**
-     * Estrae status per il backend
-     */
-    extractStatus() {
-        const status = this.data.status || {};
-        return {
-            printer_status: status.printerStatus?.displayValue || 'unknown',
-            detailed_status: status.hrDeviceStatus?.value || '',
-        };
-    }
-
-    // ==================== PHASE 2: MAPPING MANAGEMENT ====================
-
-    /**
-     * Verifica se sta usando il mapping generico (fallback)
-     */
-    isUsingGenericMapping() {
-        return this.mapping?.metadata?.name === 'generic_printer' || this.model?.fallback === true;
-    }
-
-    /**
-     * Esegue walk OID completo e lo carica al backend
-     */
-    async walkAndUploadOids() {
-        if (!this.apiClient) {
-            console.log('⚠️  No API client configured, cannot upload walk');
-            return null;
-        }
-
-        console.log('🚶 Executing OID walk for unknown printer...');
-        console.log(`   Model: ${this.model?.name || 'Unknown'}`);
-        console.log(`   Vendor: ${this.model?.vendor || 'Unknown'}`);
-
-        try {
-            // Esegui walk del Printer MIB (1.3.6.1.2.1.43)
-            const walkData = await this.snmp.walk('1.3.6.1.2.1.43');
-            
-            if (!walkData || Object.keys(walkData).length === 0) {
-                console.log('⚠️  No data collected from walk');
-                return null;
-            }
-
-            console.log(`✅ Walk completed: ${Object.keys(walkData).length} OIDs collected`);
-
-            // Prepara payload per backend
-            const payload = {
-                device_ip: this.host,
-                model: this.model?.name || 'Unknown',
-                vendor: this.model?.vendor || 'Unknown',
-                sys_descr: this.printerInfo.sysDescr || '',
-                walk_data: walkData,
-            };
-
-            // Upload al backend
-            console.log('☁️  Uploading walk to backend...');
-            const response = await this.apiClient.post('/telemetry/walks', payload);
-            console.log('✅ Walk uploaded successfully');
-            console.log(`   Walk ID: ${response.walk_id}`);
-
-            return response.walk_id;
-
-        } catch (error) {
-            console.error('❌ Failed to walk and upload OIDs:', error.message);
-            return null;
-        }
-    }
-
-    /**
-     * Marca il device come "needs_mapping" nel backend
-     */
-    async markAsUnmapped(walkId) {
-        if (!this.apiClient) {
-            console.log('⚠️  No API client configured, cannot mark as unmapped');
-            return;
-        }
-
-        try {
-            console.log('📝 Marking device as needs_mapping...');
-            
-            const payload = {
-                walk_id: walkId,
-                needs_mapping: true,
-                mapping_name: 'generic_printer',
-            };
-
-            // POST /agent/devices/:ip/mark-unmapped (public endpoint for agents)
-            await this.apiClient.post(`/agent/devices/${this.host}/mark-unmapped`, payload);
-            
-            console.log('✅ Device marked as needs_mapping');
-            console.log('   Super admin can now create specific mapping from walk data');
-
-        } catch (error) {
-            // Non bloccare l'agent se fallisce
-            console.error('⚠️  Failed to mark device as unmapped:', error.message);
-        }
-    }
-
-    /**
-     * Verifica se esistono nuovi mappings disponibili sul backend
-     */
-    async checkForNewMapping() {
-        if (!this.apiClient) {
-            return null;
-        }
-
-        try {
-            // Tenta di scaricare mapping specifico per questo modello
-            const modelName = this.model?.name || this.printerInfo.sysDescr;
-            if (!modelName) return null;
-
-            console.log(`🔍 Checking for mapping: ${modelName}`);
-            
-            // GET /agent/mappings/:name (public endpoint for agents)
-            const mapping = await this.apiClient.get(`/agent/mappings/${encodeURIComponent(modelName)}`);
-            
-            if (mapping && mapping.is_active) {
-                console.log(`✅ New mapping found: ${mapping.display_name}`);
-                console.log(`   Version: ${mapping.version}`);
-                
-                // Salva mapping in locale per cache
-                this.saveMapping(modelName, mapping.mappings);
-                
-                return mapping;
-            }
-
-        } catch (error) {
-            // 404 è normale se il mapping non esiste ancora
-            if (error.response?.status !== 404) {
-                console.error('⚠️  Failed to check for new mapping:', error.message);
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Salva mapping scaricato dal backend in locale
-     */
-    saveMapping(modelName, mappingData) {
-        try {
-            const mappingsDir = path.join(__dirname, '../mappings');
-            if (!fs.existsSync(mappingsDir)) {
-                fs.mkdirSync(mappingsDir, { recursive: true });
-            }
-
-            const filepath = path.join(mappingsDir, `${modelName}.json`);
-            fs.writeFileSync(filepath, JSON.stringify(mappingData, null, 2));
-            
-            console.log(`💾 Mapping saved locally: ${filepath}`);
-
-        } catch (error) {
-            console.error('⚠️  Failed to save mapping locally:', error.message);
-        }
-    }
 }
 
+
 /**
- * Monitora una singola stampante
+ * Monitora una singola stampante con nuova architettura v3.0
+ * Uses device config from bootstrap cache (no per-device API calls)
  */
 async function monitorPrinter(printerConfig) {
     const monitor = new PrinterMonitor(printerConfig.ip, {
@@ -723,51 +488,106 @@ async function monitorPrinter(printerConfig) {
     });
 
     try {
-        // 1. Inizializza
+        // 1. Inizializza connessione SNMP
         await monitor.initialize();
 
-        // 2. Identifica stampante
-        await monitor.identifyPrinter();
+        // 2. Get device configuration from cache
+        const deviceConfig = getDeviceConfig(printerConfig.ip);
+        console.log(`📋 Device status: ${deviceConfig.status}`);
 
-        // 3. Carica mapping
-        monitor.loadMapping();
+        // 3. Ottieni identificazione base (sempre necessaria per telemetry)
+        const identification = await monitor.getBasicIdentification();
 
-        // 4. Gestione intelligente mapping
-        const usingGeneric = monitor.isUsingGenericMapping();
-        
-        if (usingGeneric) {
-            console.log('⚠️  Stampante sconosciuta - uso mapping generico');
-            
-            // Step 1: Check se esiste già mapping specifico sul backend
-            const newMapping = await monitor.checkForNewMapping();
-            if (newMapping) {
-                console.log('🎉 Trovato mapping specifico! Ricarico...');
-                monitor.mapping = newMapping.mappings;
-                monitor.model.name = newMapping.name;
-            } else {
-                // Step 2: Walk OID e upload automatico (background per non bloccare)
-                console.log('🔍 Eseguo walk OID in background...');
-                monitor.walkAndUploadOids()
-                    .then(walkId => {
-                        if (walkId) {
-                            monitor.markAsUnmapped(walkId);
-                            console.log(`✅ [${printerConfig.ip}] Walk completato (ID: ${walkId})`);
-                        }
-                    })
-                    .catch(err => console.warn(`⚠️  [${printerConfig.ip}] Walk fallito: ${err.message}`));
+        // 4. Switch su device status (NEW ARCHITECTURE v3.0 - REFACTORED)
+        switch (deviceConfig.status) {
+            case 'discovered':
+                // New device: walk UNA VOLTA + telemetry with generic_printer
+                console.log('🆕 DISCOVERED - Device nuovo, walk automatico');
                 
-                // Continua con mapping generico (non aspetta walk)
-                console.log('   → Procedo con dati limitati (mapping generico)');
-            }
-        } else {
-            console.log('✅ Mapping specifico:', monitor.mapping.metadata.name);
+                // 1. Perform walk (UNA VOLTA, solo Printer MIB standard)
+                if (deviceConfig.walk_config.enabled) {
+                    console.log('   🚶 Walk automatico abilitato (OID: 1.3.6.1.2.1.43)');
+                    await monitor.performWalkAndUpload(identification, deviceConfig.walk_config.root_oids);
+                    console.log('   ✅ Walk completato e caricato');
+                } else {
+                    console.warn('   ⚠️  Walk config disabled (anomalo per discovered)');
+                }
+                
+                // 2. Load generic_printer mapping
+                const { MappingLoader } = require('./data-processors');
+                const genericMapping = MappingLoader.load('generic_printer');
+                monitor.mapping = genericMapping.mappings;
+                
+                // 3. Collect and send telemetry
+                await monitor.collectData();
+                await monitor.submitToBackend();
+                
+                console.log('✅ Telemetry inviato (generic_printer)');
+                console.log('   → Device creato nel DB, prossimo ciclo sarà OPERATIONAL');
+                return { success: true, ip: printerConfig.ip, status: 'discovered', telemetry_sent: true, walk_performed: true };
+
+            case 'walk_requested':
+                // Walk richiesto da dealer via frontend (UNA VOLTA)
+                console.log('🚶 WALK_REQUESTED - Walk richiesto dal dealer');
+                
+                // Check if walk is actually enabled
+                if (!deviceConfig.walk_config.enabled) {
+                    console.warn('⚠️  Walk config disabled - skip walk');
+                    return { success: true, ip: printerConfig.ip, status: 'walk_requested', telemetry_sent: false, walk_performed: false };
+                }
+                
+                console.log(`   Root OIDs custom: ${deviceConfig.walk_config.root_oids.join(', ')}`);
+                
+                // Perform walk with custom OIDs
+                await monitor.performWalkAndUpload(identification, deviceConfig.walk_config.root_oids);
+                
+                console.log('✅ Walk completato e caricato');
+                console.log('   → Backend resetterà walk_enabled=false');
+                console.log('   → Prossimo ciclo: OPERATIONAL');
+                
+                // Continue with normal telemetry (usa mapping se disponibile)
+                if (deviceConfig.mapping) {
+                    console.log('   📤 Telemetria con mapping specifico');
+                    monitor.mapping = deviceConfig.mapping;
+                } else {
+                    console.log('   📤 Telemetria con generic_printer');
+                    const { MappingLoader } = require('./data-processors');
+                    const genericMapping = MappingLoader.load('generic_printer');
+                    monitor.mapping = genericMapping.mappings;
+                }
+                
+                await monitor.collectData();
+                await monitor.submitToBackend();
+                
+                console.log('✅ Telemetry inviato');
+                return { success: true, ip: printerConfig.ip, status: 'walk_requested', telemetry_sent: true, walk_performed: true };
+
+            case 'operational':
+                // Device operativo - monitoraggio normale (NO walk)
+                console.log('✅ OPERATIONAL - Monitoraggio normale');
+                
+                // Usa mapping specifico SE disponibile, altrimenti generic_printer
+                if (deviceConfig.mapping) {
+                    console.log('   📋 Uso mapping specifico');
+                    monitor.mapping = deviceConfig.mapping;
+                } else {
+                    console.log('   📋 Uso generic_printer (no mapping assegnato)');
+                    const { MappingLoader } = require('./data-processors');
+                    const genericMapping = MappingLoader.load('generic_printer');
+                    monitor.mapping = genericMapping.mappings;
+                }
+                
+                // Collect and send telemetry (NO walk)
+                await monitor.collectData();
+                await monitor.submitToBackend();
+                
+                console.log('✅ Telemetry inviato');
+                return { success: true, ip: printerConfig.ip, status: 'operational', telemetry_sent: true, walk_performed: false };
+
+            default:
+                console.error(`❌ Unknown device status: ${deviceConfig.status}`);
+                throw new Error(`Unknown device status: ${deviceConfig.status}`);
         }
-
-        // 5. Raccolta dati + invio backend
-        await monitor.collectData();
-        await monitor.submitToBackend();
-
-        return { success: true, ip: printerConfig.ip, using_generic: usingGeneric };
 
     } catch (error) {
         console.error(`❌ Error monitoring ${printerConfig.ip}:`, error.message);
@@ -778,98 +598,60 @@ async function monitorPrinter(printerConfig) {
 }
 
 /**
- * Esegue walk OID e lo carica sul backend
- */
-async function walkAndUpload(host, community) {
-    console.log('🚶 Eseguendo walk OID completo...');
-    
-    // Import dinamico per evitare circular dependency
-    const { PrinterOidWalker } = require('./walkOids');
-    
-    const walker = new PrinterOidWalker(host, community);
-    walker.createSession();
-
-    try {
-        // 1. Test connessione
-        await walker.testConnection();
-
-        // 2. Ottieni info stampante
-        const info = await walker.getPrinterInfo();
-        console.log('📋 Info:', info.sysDescr);
-
-        // 3. Walk Printer MIB
-        const walkResults = await walker.walkPrinterMib();
-        console.log(`✅ Walk completato: ${Object.keys(walkResults).length} OID`);
-
-        // 4. Upload al backend (sempre abilitato)
-        if (apiClient && config.upload_walks) {
-            console.log('☁️  Caricamento walk sul backend...');
-            
-            const payload = {
-                device_ip: host,
-                model: walker.extractModel(info.sysDescr),
-                vendor: 'Unknown',
-                sys_descr: info.sysDescr,
-                walk_data: walkResults,
-            };
-
-            await apiClient.post('/telemetry/walks', payload);
-            console.log('✅ Walk caricato con successo');
-        } else {
-            console.log('⏭️  Upload walk disabilitato o backend non configurato');
-        }
-
-        // 5. Salva anche in locale (backup)
-        await walker.saveResults(walkResults);
-        
-    } finally {
-        walker.session.close();
-    }
-}
-
-/**
- * Monitora tutte le stampanti configurate (un ciclo)
+ * Monitora tutte le stampanti configurate
  */
 async function monitorAllPrinters() {
     console.log(`\n${'='.repeat(80)}`);
-    console.log(`🔄 CICLO MONITORAGGIO - ${new Date().toISOString()}`);
-    console.log(`${'='.repeat(80)}`);
-    
-    // 1. Verifica CLI override (per testing manuale)
-    const cliHost = argv.host;
+    console.log(`🖨️  PRINTER MONITORING CYCLE - ${new Date().toLocaleString('it-IT')}`);
+    console.log(`${'='.repeat(80)}\n`);
+
     let printersToMonitor = [];
-    
-    if (cliHost) {
-        console.log('⚠️  CLI override: monitoraggio singola stampante', cliHost);
-        printersToMonitor = [{ 
-            ip: cliHost, 
-            community: argv.community || 'public', 
-            enabled: true 
-        }];
-    } else {
-        // 2. Usa stampanti da config embedded
+
+    // 1. Se backend ha agent config, usa quella (priorità)
+    if (config.agent_id) {
+        try {
+            console.log(`📡 Fetch configurazione agent dal backend (ID: ${config.agent_id})...`);
+            const agentConfig = await apiClient.get(`/agents/${config.agent_id}/printers`);
+            printersToMonitor = agentConfig.printers || [];
+            console.log(`✅ Ricevute ${printersToMonitor.length} stampanti dal backend`);
+        } catch (error) {
+            console.warn(`⚠️  Impossibile recuperare config da backend: ${error.message}`);
+            console.log('   → Fallback a config embedded\n');
+        }
+    }
+
+    // 2. Se nessuna stampante da backend, usa config embedded
+    if (printersToMonitor.length === 0) {
         if (!config.printers || config.printers.length === 0) {
-            console.error('❌ Nessuna stampante configurata in embedded config');
+            console.error('❌ Nessuna stampante configurata');
             throw new Error('No printers configured');
         }
         
-        // Filtra stampanti abilitate
         printersToMonitor = config.printers.filter(p => p.enabled !== false);
-        console.log(`📋 Trovate ${printersToMonitor.length} stampanti abilitate (${config.printers.length} totali)`);
+        console.log(`📋 Trovate ${printersToMonitor.length} stampanti abilitate (embedded config)`);
     }
 
-    // 3. Monitora tutte le stampanti in parallelo (max 3 contemporanee)
+    // 3. Bootstrap: Get scan configuration for all devices (NEW v3.0)
+    try {
+        await bootstrapScanConfig(printersToMonitor);
+    } catch (error) {
+        console.error('❌ Errore bootstrap config:', error.message);
+        throw new Error('Cannot proceed without scan configuration');
+    }
+
+    // 4. Monitora stampanti in parallelo (max 3 contemporanee)
     const results = {
         success: 0,
         failed: 0,
-        skipped: 0,
+        walks_performed: 0,
+        telemetry_sent: 0,
         errors: [],
         total: printersToMonitor.length,
         duration: 0
     };
 
     const startTime = Date.now();
-    const MAX_CONCURRENT = 3; // Massimo 3 stampanti simultanee
+    const MAX_CONCURRENT = 3;
     
     // Esegui in batch paralleli
     for (let i = 0; i < printersToMonitor.length; i += MAX_CONCURRENT) {
@@ -877,22 +659,20 @@ async function monitorAllPrinters() {
         const batchNumber = Math.floor(i / MAX_CONCURRENT) + 1;
         const totalBatches = Math.ceil(printersToMonitor.length / MAX_CONCURRENT);
         
-        console.log(`\n� Batch ${batchNumber}/${totalBatches} - Stampanti: ${batch.map(p => p.ip).join(', ')}`);
+        console.log(`\n📦 Batch ${batchNumber}/${totalBatches} - Stampanti: ${batch.map(p => p.ip).join(', ')}`);
         
-        // Monitora batch in parallelo
         const batchPromises = batch.map(async (printerConfig) => {
             try {
                 console.log(`🖨️  [${printerConfig.ip}] Avvio monitoraggio...`);
-                await monitorPrinter(printerConfig);
+                const result = await monitorPrinter(printerConfig);
                 console.log(`✅ [${printerConfig.ip}] Completato`);
-                return { success: true, ip: printerConfig.ip };
+                return { success: true, ip: printerConfig.ip, ...result };
             } catch (error) {
                 console.error(`❌ [${printerConfig.ip}] Errore: ${error.message}`);
                 return { success: false, ip: printerConfig.ip, error: error.message };
             }
         });
         
-        // Attendi completamento batch
         const batchResults = await Promise.allSettled(batchPromises);
         
         // Elabora risultati batch
@@ -900,6 +680,8 @@ async function monitorAllPrinters() {
             if (result.status === 'fulfilled') {
                 if (result.value.success) {
                     results.success++;
+                    if (result.value.walk_performed) results.walks_performed++;
+                    if (result.value.telemetry_sent) results.telemetry_sent++;
                 } else {
                     results.failed++;
                     results.errors.push({ 
@@ -926,6 +708,8 @@ async function monitorAllPrinters() {
     console.log(`   📋 Totale: ${results.total} stampanti`);
     console.log(`   ✅ Successi: ${results.success} (${Math.round(results.success/results.total*100)}%)`);
     console.log(`   ❌ Errori: ${results.failed} (${Math.round(results.failed/results.total*100)}%)`);
+    console.log(`   🚶 Walk eseguiti: ${results.walks_performed}`);
+    console.log(`   📤 Telemetry inviati: ${results.telemetry_sent}`);
     console.log(`   ⏱️  Durata: ${(results.duration / 1000).toFixed(2)}s`);
     console.log(`   🚀 Velocità: ${(results.duration / results.total / 1000).toFixed(2)}s/stampante (media)`);
     
@@ -941,50 +725,40 @@ async function monitorAllPrinters() {
 }
 
 /**
- * Funzione principale (single-run mode)
- */
-async function main() {
-    console.log('🎯 Modalità SINGLE-RUN\n');
-
-    // Esegui un ciclo completo
-    await monitorAllPrinters();
-    
-    console.log('\n✅ Ciclo monitoraggio completato');
-}
-
-/**
- * Modalità Daemon - Esegue monitoring continuo
+ * Daemon mode - monitoring loop
  */
 async function runDaemon() {
-    const intervalMinutes = config.interval_minutes;
+    const intervalMinutes = parseInt(process.env.INTERVAL_MINUTES || '15', 10);
     const intervalMs = intervalMinutes * 60 * 1000;
-    
-    console.log('� MODALITÀ DAEMON ATTIVATA');
-    console.log(`   Intervallo: ${intervalMinutes} minuti`);
-    console.log(`   Stampanti configurate: ${config.printers?.length || 0}`);
-    console.log(`   Backend: ${config.backend_url || 'disabled'}`);
-    console.log('');
 
-    // Graceful shutdown handlers
-    let isShuttingDown = false;
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`🔄 DAEMON MODE - Printer Monitoring Service (v3.0 Refactored)`);
+    console.log(`${'='.repeat(80)}`);
+    console.log(`   🕐 Intervallo: ${intervalMinutes} minuti (${intervalMs}ms)`);
+    console.log(`   🏢 Company ID: ${config.company_id}`);
+    console.log(`   🆔 Agent ID: ${config.agent_id || 'Non configurato'}`);
+    console.log(`   🔗 Backend: ${config.backend_url}`);
+    console.log(`   🎯 Architecture: Backend as Single Source of Truth (v3.0)`);
+    console.log(`   🚶 Walk: One-shot (discovered + walk_requested)`);
+    console.log(`${'='.repeat(80)}\n`);
+
     let intervalId = null;
-    
+    let isShuttingDown = false;
+
     const shutdown = async (signal) => {
         if (isShuttingDown) return;
         isShuttingDown = true;
+
+        console.log(`\n⚠️  Ricevuto segnale ${signal} - Arresto in corso...`);
         
-        console.log(`\n⚠️  Ricevuto ${signal}, arresto in corso...`);
-        
-        // Stop interval
         if (intervalId) {
             clearInterval(intervalId);
         }
-        
-        console.log('✅ Agent arrestato correttamente');
+
+        console.log('✅ Daemon arrestato correttamente');
         process.exit(0);
     };
 
-    // Registra signal handlers
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
 
@@ -1020,6 +794,14 @@ async function runDaemon() {
     console.log('   Premi Ctrl+C per arrestare\n');
 }
 
+/**
+ * Funzione principale (single-run mode)
+ */
+async function main() {
+    console.log('🎯 Modalità SINGLE-RUN\n');
+    await monitorAllPrinters();
+}
+
 // Esegui solo se chiamato direttamente
 if (require.main === module) {
     const isDaemon = argv.daemon || process.env.DAEMON_MODE === 'true';
@@ -1030,7 +812,6 @@ if (require.main === module) {
             process.exit(1);
         });
     } else {
-        // Esecuzione singola (testing o CLI override)
         main().catch((error) => {
             console.error('❌ Error:', error);
             process.exit(1);
@@ -1038,4 +819,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { PrinterMonitor };
+module.exports = { PrinterMonitor, monitorPrinter, monitorAllPrinters };
