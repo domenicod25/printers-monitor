@@ -728,7 +728,7 @@ async function monitorAllPrinters() {
  * Daemon mode - monitoring loop
  */
 async function runDaemon() {
-    const intervalMinutes = parseInt(process.env.INTERVAL_MINUTES || '15', 10);
+    const intervalMinutes = parseInt(process.env.INTERVAL_MINUTES || '5', 10);
     const intervalMs = intervalMinutes * 60 * 1000;
 
     console.log(`\n${'='.repeat(80)}`);
