@@ -17,8 +17,8 @@ const argv = require('minimist')(process.argv.slice(2));
 const config = {
     host: argv.host || process.env.PRINTER_HOST || '192.168.180.141',
     community: argv.community || 'public',
-    timeout: 10000,
-    retries: 2
+    timeout: 60000,  // 60s per walk completi (stampanti lente)
+    retries: 5       // Più tentativi per OID problematici
 };
 
 // OID per identificare la stampante
@@ -357,7 +357,7 @@ class PrinterOidWalker {
     }
 
     /**
-     * Parser intelligente per i valori OID (ottimizzato)
+     * Parser intelligente per i valori OID (COMPLETO - nessun filtro)
      */
     parseOidValue(vb) {
         let value, type;
@@ -370,14 +370,10 @@ class PrinterOidWalker {
                 value = stringValue.trim();
                 type = 'string';
             } else {
-                // Solo hex per dati binari significativi (evita hex lunghi inutili)
-                if (vb.value.length > 100) {
-                    value = `<binary data ${vb.value.length} bytes>`;
-                    type = 'binary';
-                } else {
-                    value = vb.value.toString('hex');
-                    type = 'hex';
-                }
+                // Salva SEMPRE hex completo (rimuovi limite 100 bytes)
+                // I valori cercati potrebbero essere in dati binari
+                value = vb.value.toString('hex');
+                type = 'hex';
             }
         } else if (typeof vb.value === 'number') {
             value = vb.value;
@@ -395,26 +391,15 @@ class PrinterOidWalker {
 
     /**
      * Filtra OID inutili o troppo lunghi
+     * MODIFICATO: Cattura TUTTO per walk completi
      */
     shouldSkipOid(oid, value) {
-        // Skip OID di firmware/software version troppo lunghi
-        if (value.type === 'binary') return true;
-        
-        // Skip stringhe vuote
+        // Skip SOLO stringhe completamente vuote
         if (value.type === 'string' && !value.value) return true;
         
-        // Skip OID di metadata poco utili
-        const skipPatterns = [
-            /\.1\.3\.6\.1\.2\.1\.25\./, // Host Resources MIB (spesso verboso)
-            /\.1\.3\.6\.1\.4\.1\./, // Enterprise OIDs (troppo specifici)
-        ];
-        
-        // NON skipare Printer MIB principale
-        if (oid.startsWith('1.3.6.1.2.1.43.')) {
-            return false;
-        }
-        
-        return skipPatterns.some(pattern => pattern.test(oid));
+        // CATTURA TUTTO: binary, enterprise, host resources
+        // I valori cercati (copie, toner, ecc) potrebbero essere ovunque
+        return false;
     }
 
     /**

@@ -266,16 +266,19 @@ class PrinterMonitor {
             await walker.testConnection();
 
             // 2. Walk OIDs (multi-root support)
-            let walkResults;
+            let walkResponse;
             if (rootOids && rootOids.length > 0) {
                 console.log(`   Walking ${rootOids.length} root OIDs: ${rootOids.join(', ')}`);
-                walkResults = await walker.walkMultipleRoots(rootOids);
+                walkResponse = await walker.walkMultipleRoots(rootOids);
             } else {
                 console.log('   Walking default Printer MIB');
-                walkResults = await walker.walkPrinterMib();
+                walkResponse = await walker.walkPrinterMib();
             }
             
-            console.log(`✅ Walk completato: ${Object.keys(walkResults).length} OID`);
+            // Extract actual OID results from wrapper
+            const walkResults = walkResponse.results || walkResponse;
+            const oidCount = Object.keys(walkResults).length;
+            console.log(`✅ Walk completato: ${oidCount} OID`);
 
             // 3. Upload al backend
             console.log('☁️  Caricamento walk sul backend...');
