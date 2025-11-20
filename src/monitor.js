@@ -48,7 +48,7 @@ console.log('🎯 Architecture: Backend as Single Source of Truth\n');
 // ============================================
 let SCAN_CONFIG_CACHE = null;
 let SCAN_CONFIG_TIMESTAMP = null;
-const SCAN_CONFIG_TTL = 5 * 60 * 1000; // 5 minuti cache
+const SCAN_CONFIG_TTL = 0; //5 * 60 * 1000; Cache disabilitata - fetch fresca ogni ciclo
 
 /**
  * Bootstrap: Get scan configuration for all devices (with cache)
